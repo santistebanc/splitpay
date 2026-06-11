@@ -1,0 +1,17 @@
+{
+  "name": "splitpay",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "bash scripts/dev-local.sh",
+    "dev:mobile": "npm --workspace apps/mobile run start",
+    "dev:web": "npm --workspace apps/mobile run web",
+    "serve:web": "npm --workspace apps/mobile run serve:web",
+    "deploy:supabase": "bash supabase/deploy.sh",
+    "typecheck": "npm --workspaces run typecheck",
+    "lint": "npm --workspaces run lint"
+  }
+}

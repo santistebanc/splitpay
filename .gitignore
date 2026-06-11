@@ -1,0 +1,30 @@
+node_modules/
+.expo/
+dist/
+web-build/
+.DS_Store
+*.log
+.env
+.env.local
+
+# Generated native project (recreate with `expo prebuild`)
+/apps/mobile/android/
+/apps/mobile/ios/
+
+# Local scratch
+output/
+.temp/
+
+# Agent tooling / local learning workspace (not product code)
+.agents/
+learn/
+
+# Android SDK must NOT live in the repo. If a tool installs it here
+# (sdk.dir pointing at the repo root), these are the folders it creates.
+/ndk/
+/build-tools/
+/platforms/
+/platform-tools/
+/cmake/
+/licenses/
+/.knownPackages

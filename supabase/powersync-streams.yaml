@@ -1,0 +1,47 @@
+config:
+  edition: 3
+
+streams:
+  user_groups:
+    auto_subscribe: true
+    queries:
+      - |
+        SELECT groups.*
+        FROM groups
+        JOIN members ON members.group_id = groups.id
+        WHERE members.user_id::text = auth.user_id()
+          AND members.deleted_at IS NULL
+      - |
+        SELECT members.*
+        FROM members
+        WHERE members.group_id IN (
+          SELECT group_id FROM members
+          WHERE user_id::text = auth.user_id()
+            AND deleted_at IS NULL
+        )
+      - |
+        SELECT expenses.*
+        FROM expenses
+        WHERE expenses.group_id IN (
+          SELECT group_id FROM members
+          WHERE user_id::text = auth.user_id()
+            AND deleted_at IS NULL
+        )
+      - |
+        SELECT expense_splits.*
+        FROM expense_splits
+        JOIN expenses ON expenses.id = expense_splits.expense_id
+        WHERE expenses.group_id IN (
+          SELECT group_id FROM members
+          WHERE user_id::text = auth.user_id()
+            AND deleted_at IS NULL
+        )
+      - |
+        SELECT activity_logs.*
+        FROM activity_logs
+        WHERE activity_logs.group_id IN (
+          SELECT group_id FROM members
+          WHERE user_id::text = auth.user_id()
+            AND deleted_at IS NULL
+        )
+

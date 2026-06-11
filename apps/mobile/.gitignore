@@ -1,0 +1,63 @@
+# Dependencies
+node_modules/
+
+# Expo
+.expo/
+.expo-shared/
+dist/
+web-build/
+
+# Native build outputs
+android/.gradle/
+android/app/build/
+android/build/
+android/.cxx/
+android/local.properties
+android/captures/
+ios/build/
+ios/Pods/
+ios/DerivedData/
+
+# Metro, React Native, and bundler caches
+.metro-cache/
+.react-native/
+.cache/
+*.bundle
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Credentials and signing material
+*.jks
+*.keystore
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test and coverage output
+coverage/
+.nyc_output/
+
+# Generated app artifacts
+*.apk
+*.aab
+*.ipa

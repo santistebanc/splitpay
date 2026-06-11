@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "SplitPay",
+    "slug": "splitpay",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "splitpay",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.splitpay.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#f4f7fb"
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "9da8201d-7517-4c7e-9f02-497b45cc6414"
+      }
+    }
+  }
+}
