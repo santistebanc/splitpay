@@ -1,10 +1,13 @@
+import { MIN_GROUP_PASSWORD_LENGTH, rememberPendingGroupPassword } from "./groupPassword";
 import { calculateBalances, isSettlementPayment } from "./ledger";
+import { DEFAULT_MEMBER_NAME, DUPLICATE_MEMBER_NAME_ERROR, isMemberNameTaken } from "./memberNames";
 import { powersync, setupPowerSync } from "./localFirst/system";
 import { ensureAnonymousSession, supabase } from "./localFirst/supabase";
 
 export type Member = {
   id: string;
   displayName: string;
+  claimed: boolean;
 };
 
 export type Expense = {
@@ -118,62 +121,167 @@ type JoinSnapshot = {
   activity_logs: Required<ActivityRow>[];
 };
 
+// Creates a group with a list of named member slots. Exactly one slot is the
+// creator (the one this device claims); it carries this device's device_id so
+// the creator is recognized offline, and is bound to a user_id server-side at
+// ratification. Every other slot starts unclaimed and can be claimed on join.
 export async function createGroup(input: {
   name: string;
-  displayName: string;
+  members: { name: string; isMe: boolean }[];
   deviceId: string;
   currency: string;
+  password?: string | null;
 }) {
   await setupPowerSync();
   const now = new Date().toISOString();
   const groupId = createId();
-  const memberId = createId();
   const code = createCode();
-  const displayName = input.displayName.trim() || "Friend";
   const groupName = input.name.trim();
+  const trimmedPassword = input.password?.trim() ?? "";
+  if (trimmedPassword.length > 0) {
+    if (trimmedPassword.length < MIN_GROUP_PASSWORD_LENGTH) {
+      throw new Error(`Password must be at least ${MIN_GROUP_PASSWORD_LENGTH} characters`);
+    }
+    await rememberPendingGroupPassword(groupId, trimmedPassword);
+  }
+
+  const named = input.members
+    .map((member) => ({ name: member.name.trim() || DEFAULT_MEMBER_NAME, isMe: member.isMe }));
+  const slots = named.length > 0 ? named : [{ name: DEFAULT_MEMBER_NAME, isMe: true }];
+  // Guarantee exactly one creator slot.
+  if (!slots.some((slot) => slot.isMe)) slots[0].isMe = true;
 
   await powersync.execute(
     `INSERT INTO groups (id, code, name, currency, created_at, updated_at, deleted_at)
      VALUES (?, ?, ?, ?, ?, ?, NULL)`,
     [groupId, code, groupName, input.currency, now, now]
   );
-  await powersync.execute(
-    `INSERT INTO members (id, group_id, display_name, device_id, user_id, created_at, updated_at, deleted_at)
-     VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)`,
-    [memberId, groupId, displayName, input.deviceId, now, now]
-  );
+
+  let myMemberId = "";
+  let myName = DEFAULT_MEMBER_NAME;
+  for (const slot of slots) {
+    const memberId = createId();
+    const deviceId = slot.isMe ? input.deviceId : null;
+    await powersync.execute(
+      `INSERT INTO members (id, group_id, display_name, device_id, user_id, created_at, updated_at, deleted_at)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, NULL)`,
+      [memberId, groupId, slot.name, deviceId, now, now]
+    );
+    if (slot.isMe) {
+      myMemberId = memberId;
+      myName = slot.name;
+    }
+  }
+
   await insertActivity(groupId, {
     type: "group.created",
-    actorMemberId: memberId,
-    actorName: displayName,
-    summary: `${displayName} created ${groupName}`,
+    actorMemberId: myMemberId,
+    actorName: myName,
+    summary: `${myName} created ${groupName}`,
     metadata: { groupName, code }
   });
 
   return fetchGroup(code, input.deviceId);
 }
 
+// Adds an unclaimed member slot to a group. Works offline; the slot syncs as
+// unclaimed and can later be claimed by a joiner.
+export async function addMember(code: string, name: string, deviceId?: string) {
+  await setupPowerSync();
+  const group = await findGroupByCode(code);
+  if (!group) throw new Error("Group not found locally");
+  const memberName = name.trim() || DEFAULT_MEMBER_NAME;
+  const existing = await powersync.getAll<{ display_name: string }>(
+    "SELECT display_name FROM members WHERE group_id = ? AND deleted_at IS NULL",
+    [group.id]
+  );
+  if (isMemberNameTaken(existing.map((row) => row.display_name), memberName)) {
+    throw new Error(DUPLICATE_MEMBER_NAME_ERROR);
+  }
+  const now = new Date().toISOString();
+  const memberId = createId();
+
+  await powersync.execute(
+    `INSERT INTO members (id, group_id, display_name, device_id, user_id, created_at, updated_at, deleted_at)
+     VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL)`,
+    [memberId, group.id, memberName, now, now]
+  );
+  await insertActivity(group.id, {
+    type: "member.added",
+    actorMemberId: memberId,
+    actorName: memberName,
+    summary: `${memberName} was added`,
+    metadata: { displayName: memberName }
+  });
+
+  return fetchGroup(code, deviceId);
+}
+
+// Soft-removes a member slot. The server rejects this if the slot has any
+// expenses/splits, or if the caller isn't allowed to remove it.
+export async function removeMember(code: string, memberId: string, deviceId?: string) {
+  await setupPowerSync();
+  const group = await findGroupByCode(code);
+  if (!group) throw new Error("Group not found locally");
+  const member = await powersync.getOptional<MemberRow>(
+    "SELECT * FROM members WHERE id = ? AND group_id = ? AND deleted_at IS NULL",
+    [memberId, group.id]
+  );
+  if (!member) throw new Error("Member not found");
+  if (member.user_id != null) {
+    throw new Error("Claimed members can't be removed. They need to leave the group themselves.");
+  }
+
+  const now = new Date().toISOString();
+  await powersync.execute("UPDATE members SET deleted_at = ?, updated_at = ? WHERE id = ?", [now, now, memberId]);
+  await insertActivity(group.id, {
+    type: "member.removed",
+    actorMemberId: memberId,
+    actorName: member.display_name,
+    summary: `${member.display_name} was removed`,
+    metadata: { displayName: member.display_name }
+  });
+
+  return fetchGroup(code, deviceId);
+}
+
+// A member slot as shown in the join picker.
+export type GroupSlot = {
+  id: string;
+  name: string;
+  claimed: boolean;
+};
+
+// Online-only: reveal a group's member slots (taken/available) so the joiner
+// can pick one to claim or decide to add a new name. Password-gated server-side.
+export async function previewGroupMembers(
+  code: string,
+  input: { password?: string } = {}
+): Promise<GroupSlot[]> {
+  await setupPowerSync();
+  if (!supabase) throw new Error("Joining a group needs you to be online.");
+  await ensureAnonymousSession();
+  const { data, error } = await supabase.functions.invoke<{ members?: GroupSlot[] }>("join-group", {
+    body: { code: code.toUpperCase(), preview: true, password: input.password }
+  });
+  if (error) {
+    const parsed = await parseFunctionError(error, "Could not load members");
+    throw new JoinError(parsed.message, parsed.needsPassword);
+  }
+  return data?.members ?? [];
+}
+
 export async function joinGroup(
   code: string,
-  input: { displayName: string; deviceId: string; password?: string }
+  input: { displayName: string; deviceId: string; password?: string; memberId?: string }
 ) {
   await setupPowerSync();
   const normalizedCode = code.toUpperCase();
-  const displayName = input.displayName.trim() || "Friend";
+  const displayName = input.displayName.trim() || DEFAULT_MEMBER_NAME;
 
-  // Re-opening a group we're already a member of works offline.
-  const localGroup = await findGroupByCode(normalizedCode);
-  if (localGroup) {
-    const existing = await powersync.getOptional<MemberRow>(
-      "SELECT * FROM members WHERE group_id = ? AND device_id = ? AND deleted_at IS NULL",
-      [localGroup.id, input.deviceId]
-    );
-    if (existing) {
-      return fetchGroup(normalizedCode, input.deviceId);
-    }
-  }
-
-  // Joining a new group always goes through the (password-gated) server.
+  // Joining always goes through the server so slot picks (including "someone
+  // else" after leaving locally) are honored. Re-opening a known group offline
+  // uses fetchGroup instead.
   await joinGroupByCodeOnServer(normalizedCode, { ...input, displayName });
   const group = await waitForGroupByCode(normalizedCode);
   if (!group) throw new Error("Group could not be joined");
@@ -183,7 +291,7 @@ export async function joinGroup(
 
 async function joinGroupByCodeOnServer(
   code: string,
-  input: { displayName: string; deviceId: string; password?: string }
+  input: { displayName: string; deviceId: string; password?: string; memberId?: string }
 ) {
   if (!supabase) {
     throw new Error("Joining a group needs you to be online.");
@@ -195,7 +303,8 @@ async function joinGroupByCodeOnServer(
       code,
       displayName: input.displayName,
       deviceId: input.deviceId,
-      password: input.password
+      password: input.password,
+      memberId: input.memberId
     }
   });
 
@@ -316,7 +425,8 @@ export async function fetchGroup(code: string, deviceId?: string) {
 
   const shapedMembers = members.map((member) => ({
     id: member.id,
-    displayName: member.display_name
+    displayName: member.display_name,
+    claimed: member.user_id != null
   }));
   const shapedExpenses = expenses.map((expense) => ({
     id: expense.id,
@@ -399,16 +509,54 @@ export async function updateMemberName(code: string, displayName: string, device
     [group.id, deviceId]
   );
   if (!member) throw new Error("You are not a member of this group");
+  return renameMember(code, member.id, displayName, deviceId);
+}
 
-  const nextName = displayName.trim() || "Friend";
+export async function renameMember(code: string, memberId: string, displayName: string, deviceId?: string) {
+  await setupPowerSync();
+  if (!deviceId) throw new Error("Device id is required");
+  const group = await findGroupByCode(code);
+  if (!group) throw new Error("Group not found locally");
+
+  const member = await powersync.getOptional<MemberRow>(
+    "SELECT * FROM members WHERE id = ? AND group_id = ? AND deleted_at IS NULL",
+    [memberId, group.id]
+  );
+  if (!member) throw new Error("Member not found");
+
+  const currentMember = await powersync.getOptional<MemberRow>(
+    "SELECT * FROM members WHERE group_id = ? AND device_id = ? AND deleted_at IS NULL",
+    [group.id, deviceId]
+  );
+  if (!currentMember) throw new Error("You are not a member of this group");
+
+  const isOwnSlot = member.id === currentMember.id;
+  const isUnclaimed = member.user_id == null;
+  if (!isOwnSlot && !isUnclaimed) {
+    throw new Error("You can only rename your own profile or an unclaimed member");
+  }
+
+  const nextName = displayName.trim() || DEFAULT_MEMBER_NAME;
+  if (nextName === member.display_name) return fetchGroup(code, deviceId);
+
+  const existing = await powersync.getAll<{ display_name: string }>(
+    "SELECT display_name FROM members WHERE group_id = ? AND deleted_at IS NULL AND id != ?",
+    [group.id, member.id]
+  );
+  if (isMemberNameTaken(existing.map((row) => row.display_name), nextName)) {
+    throw new Error(DUPLICATE_MEMBER_NAME_ERROR);
+  }
+
   const now = new Date().toISOString();
   await powersync.execute("UPDATE members SET display_name = ?, updated_at = ? WHERE id = ?", [nextName, now, member.id]);
   await insertActivity(group.id, {
     type: "member.updated",
-    actorMemberId: member.id,
-    actorName: nextName,
-    summary: `${nextName} updated their name`,
-    metadata: { previousName: member.display_name, displayName: nextName }
+    actorMemberId: currentMember.id,
+    actorName: currentMember.display_name,
+    summary: isOwnSlot
+      ? `${nextName} updated their name`
+      : `${currentMember.display_name} renamed ${member.display_name} to ${nextName}`,
+    metadata: { previousName: member.display_name, displayName: nextName, memberId: member.id }
   });
   return fetchGroup(code, deviceId);
 }

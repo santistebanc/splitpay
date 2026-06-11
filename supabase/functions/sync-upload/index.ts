@@ -1,13 +1,17 @@
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders, getErrorMessage, json } from "../_shared/cors.ts";
+import { DUPLICATE_MEMBER_NAME_ERROR, memberDisplayNameTaken } from "../_shared/member-names.ts";
 import { isActiveMember, memberBelongsToGroup } from "../_shared/membership.ts";
 
 // sync-upload is the authorization boundary for all generic writes. It runs with
 // the service role (bypassing RLS), so every operation must be explicitly
 // authorized here:
-//   - groups/members lifecycle is NOT allowed through this path (use the
-//     create-group / join-group / set-password Edge Functions instead).
-//   - members may PATCH only their own row's safe fields.
+//   - group creation and the *claiming* of a member (binding a user_id) are NOT
+//     allowed through this path (use the create-group / join-group Edge
+//     Functions instead). user_id is never client-writable here.
+//   - members: an active member may create UNCLAIMED slots (PUT, insert-only),
+//     rename their own claimed slot or any unclaimed slot (PATCH), and remove a
+//     slot they're allowed to remove (soft-delete via PATCH deleted_at).
 //   - groups may be PATCHed (e.g. rename) only by an active member; code and
 //     has_password can never be changed from the client.
 //   - expenses/splits/activity require the caller to be an active member of the
@@ -111,27 +115,136 @@ async function applyGroupOperation(supabase: SupabaseClient, operation: Operatio
 }
 
 async function applyMemberOperation(supabase: SupabaseClient, operation: Operation, userId: string) {
-  // Membership is created server-side only (create-group / join-group).
+  const data = operation.data ?? {};
+
   if (operation.op === "PUT") {
-    return json({ error: "Membership is managed by create-group / join-group" }, 403);
+    return createUnclaimedSlot(supabase, operation, userId);
   }
+
   if (operation.op === "DELETE") {
-    return json({ error: "Removing members is not supported" }, 403);
+    // PowerSync uses PATCH (deleted_at) for soft-deletes; a hard DELETE op
+    // would mean a true row removal, which we never do for members.
+    return json({ error: "Members are removed via soft-delete" }, 403);
   }
-  // PATCH: a member may only edit their own row's safe fields.
+
+  // PATCH. Load the target row so we can authorize against its current state.
   const { data: member, error: memberError } = await supabase
     .from("members")
-    .select("id, user_id")
+    .select("id, group_id, user_id, deleted_at")
     .eq("id", operation.id)
     .maybeSingle();
   if (memberError) return json({ error: memberError.message }, 400);
-  if (!member || member.user_id !== userId) {
-    return json({ error: "You can only edit your own member profile" }, 403);
+  if (!member) return json({ error: "Member not found" }, 404);
+
+  // Claiming (assigning/changing user_id) is server-only.
+  if ("user_id" in data && data.user_id !== member.user_id) {
+    return json({ error: "Claiming a member is done through join-group" }, 403);
   }
-  const data = pick(operation.data ?? {}, safeColumns.members);
-  const { error } = await supabase.from("members").update(data).eq("id", operation.id);
+
+  const isOwner = member.user_id === userId;
+  const isUnclaimed = member.user_id == null;
+  const callerIsMember = await isActiveMember(supabase, member.group_id as string, userId);
+
+  // Removal: PATCH that sets deleted_at. Owner may leave; any active member may
+  // remove an unclaimed slot. A slot with history must be settled first.
+  const removing = "deleted_at" in data && data.deleted_at != null && member.deleted_at == null;
+  if (removing) {
+    if (!(isOwner || (isUnclaimed && callerIsMember))) {
+      return json({ error: "You can't remove this member" }, 403);
+    }
+    if (await hasLedgerHistory(supabase, operation.id)) {
+      return json(
+        { error: "This member has expenses. Settle and remove them first." },
+        409
+      );
+    }
+    const { error } = await supabase
+      .from("members")
+      .update({ deleted_at: data.deleted_at, updated_at: new Date().toISOString() })
+      .eq("id", operation.id);
+    if (error) return json({ error: error.message }, 400);
+    return null;
+  }
+
+  // Rename / profile edit. Owner edits their own slot; an active member may
+  // rename an unclaimed slot. device_id may only be set by the owner.
+  if (!(isOwner || (isUnclaimed && callerIsMember))) {
+    return json({ error: "You can only edit your own profile or an unclaimed member" }, 403);
+  }
+  const editable = isOwner ? safeColumns.members : ["display_name", "updated_at"];
+  const update = pick(data, editable);
+  if (Object.keys(update).length === 0) return null;
+  if (typeof update.display_name === "string") {
+    if (await memberDisplayNameTaken(supabase, member.group_id as string, update.display_name, operation.id)) {
+      return json({ error: DUPLICATE_MEMBER_NAME_ERROR }, 409);
+    }
+  }
+  const { error } = await supabase.from("members").update(update).eq("id", operation.id);
   if (error) return json({ error: error.message }, 400);
   return null;
+}
+
+// Creates an unclaimed member slot. Insert-only and never sets user_id, so it
+// cannot overwrite an existing (possibly claimed) row — e.g. the creator's slot
+// that create-group already bound. Any active member of the group may add slots.
+async function createUnclaimedSlot(supabase: SupabaseClient, operation: Operation, userId: string) {
+  const data = operation.data ?? {};
+  if (data.user_id != null) {
+    return json({ error: "New members are created unclaimed; use join-group to claim" }, 403);
+  }
+  const groupId = typeof data.group_id === "string" ? data.group_id : null;
+  if (!groupId) return json({ error: "Could not resolve group for member" }, 400);
+  if (!(await isActiveMember(supabase, groupId, userId))) {
+    return json({ error: "Not authorized for this group" }, 403);
+  }
+
+  // Idempotent / safe against the creator-slot redundancy: if the row already
+  // exists we leave it untouched (it may already be claimed server-side).
+  const { data: existing, error: existingError } = await supabase
+    .from("members")
+    .select("id")
+    .eq("id", operation.id)
+    .maybeSingle();
+  if (existingError) return json({ error: existingError.message }, 400);
+  if (existing) return null;
+
+  const displayName = typeof data.display_name === "string" ? data.display_name : "Member";
+  if (await memberDisplayNameTaken(supabase, groupId, displayName)) {
+    return json({ error: DUPLICATE_MEMBER_NAME_ERROR }, 409);
+  }
+
+  const now = new Date().toISOString();
+  const { error } = await supabase.from("members").insert({
+    id: operation.id,
+    group_id: groupId,
+    display_name: displayName,
+    device_id: null,
+    user_id: null,
+    created_at: typeof data.created_at === "string" ? data.created_at : now,
+    updated_at: now,
+    deleted_at: null
+  });
+  if (error) return json({ error: error.message }, 400);
+  return null;
+}
+
+// True if the member is referenced by any live expense (as payer) or split.
+async function hasLedgerHistory(supabase: SupabaseClient, memberId: string): Promise<boolean> {
+  const { count: payerCount, error: payerError } = await supabase
+    .from("expenses")
+    .select("id", { count: "exact", head: true })
+    .eq("paid_by_member_id", memberId)
+    .is("deleted_at", null);
+  if (payerError) throw payerError;
+  if ((payerCount ?? 0) > 0) return true;
+
+  const { count: splitCount, error: splitError } = await supabase
+    .from("expense_splits")
+    .select("id", { count: "exact", head: true })
+    .eq("member_id", memberId)
+    .is("deleted_at", null);
+  if (splitError) throw splitError;
+  return (splitCount ?? 0) > 0;
 }
 
 async function applyDataOperation(supabase: SupabaseClient, operation: Operation, userId: string) {

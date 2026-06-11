@@ -16,15 +16,37 @@ npm install
 npm run dev
 ```
 
-This exports and serves the web app on `http://127.0.0.1:8082`.
+`npm run dev` starts the Expo dev server with **hot reload (Fast Refresh)** — edits to
+`App.tsx` and `src/**` update the running app instantly. It's interactive: press `w` for
+web, `a` for Android, `i` for iOS, or scan the QR code with Expo Go.
 
-For Expo's interactive mobile tools, use:
+### Dev commands
+
+| Command | What it does |
+| --- | --- |
+| `npm run dev` | Dev server with hot reload (interactive: w / a / i / QR) |
+| `npm run dev:web` | Open the web app directly, with hot reload |
+| `npm run dev:android` | Launch on an Android emulator/device |
+| `npm run dev:ios` | Launch on an iOS simulator |
+| `npm run dev:tunnel` | Same as `dev`, over a public tunnel (best for testing on a phone) |
+| `npm test` | Run unit tests (Vitest) |
+| `npm run typecheck` | Type-check all workspaces |
+
+On **WSL2**, `npm run dev` auto-binds Metro to your WSL IP and prints the URL to open
+from Windows (e.g. `http://172.x.x.x:8081`).
+
+### Static web preview (no hot reload)
+
+A production-style static build, served locally — useful as a reliable fallback:
 
 ```bash
-npm run dev:mobile
+npm run web:preview   # build + serve on http://127.0.0.1:8082
+npm run web:watch     # auto-rebuild the static export on save (then refresh the page)
+npm run web:build     # just produce the static bundle in apps/mobile/dist
 ```
 
-The app works locally without server environment variables. In that mode, changes are stored offline on the device only and do not sync to other users.
+The app works locally without server environment variables. In that mode, changes are
+stored offline on the device only and do not sync to other users.
 
 ## Sync Setup
 

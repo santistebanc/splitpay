@@ -1,11 +1,28 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders, getErrorMessage, json } from "../_shared/cors.ts";
 import { findActiveMembership } from "../_shared/membership.ts";
+import { hashPassword } from "../_shared/password.ts";
+
+const MIN_PASSWORD_LENGTH = 4;
 
 // Ratifies a locally-created (offline) group on the server. This is the only
-// way a group + its first member come into existence server-side; the generic
-// sync-upload path rejects client-side group/member inserts. Idempotent: safe
-// to retry. Cannot be used to join an existing group (that path is join-group).
+// way a group + its initial members come into existence server-side; the
+// generic sync-upload path only allows *unclaimed* member slots, never the
+// creator's claimed binding. Idempotent: safe to retry. Cannot be used to join
+// an existing group (that path is join-group).
+//
+// A group is created with a list of named member "slots". Exactly one of them
+// is the creator, identified by `creatorMemberId`; that slot is bound to the
+// caller's user_id (it is "claimed"). Every other slot is created unclaimed
+// (user_id NULL) so anyone can later claim it via join-group.
+
+type IncomingMember = {
+  id?: string;
+  name?: string;
+  displayName?: string;
+  deviceId?: string | null;
+  createdAt?: string;
+};
 
 type CreateRequest = {
   groupId?: string;
@@ -13,11 +30,21 @@ type CreateRequest = {
   name?: string;
   currency?: string;
   createdAt?: string;
+  creatorMemberId?: string;
+  members?: IncomingMember[];
+  password?: string | null;
+  // Back-compat: the old single-member shape.
   member?: {
     id?: string;
     displayName?: string;
-    deviceId?: string;
+    deviceId?: string | null;
   };
+};
+
+type NormalizedMember = {
+  id: string;
+  name: string;
+  deviceId: string | null;
 };
 
 Deno.serve(async (request) => {
@@ -51,12 +78,17 @@ Deno.serve(async (request) => {
   const name = body?.name?.trim() ?? "";
   const currency = body?.currency?.trim() || "EUR";
   const createdAt = body?.createdAt ?? new Date().toISOString();
-  const memberId = body?.member?.id?.trim() ?? "";
-  const displayName = body?.member?.displayName?.trim() || "Friend";
-  const deviceId = body?.member?.deviceId?.trim() || null;
 
-  if (!groupId || !code || !name || !memberId) {
-    return json({ error: "groupId, code, name and member.id are required" }, 400);
+  const { members, creatorMemberId } = normalizeMembers(body);
+
+  if (!groupId || !code || !name || members.length === 0 || !creatorMemberId) {
+    return json(
+      { error: "groupId, code, name, members and creatorMemberId are required" },
+      400
+    );
+  }
+  if (!members.some((member) => member.id === creatorMemberId)) {
+    return json({ error: "creatorMemberId must be one of the members" }, 400);
   }
 
   try {
@@ -68,12 +100,13 @@ Deno.serve(async (request) => {
     if (existingError) throw existingError;
 
     if (existingGroup) {
-      // Group already ratified. Only the existing creator/member may "re-ratify"
+      // Group already ratified. Only an existing active member may "re-ratify"
       // (idempotent retry). Reject anyone else so this can't be used to join.
       const membership = await findActiveMembership(supabase, groupId, userId);
       if (!membership) {
         return json({ error: "Group already exists" }, 409);
       }
+      await applyOptionalPassword(supabase, groupId, body?.password);
       return json({ code: existingGroup.code });
     }
 
@@ -91,23 +124,65 @@ Deno.serve(async (request) => {
       now
     });
 
-    const { error: memberError } = await supabase.from("members").insert({
-      id: memberId,
+    // Insert every slot. Only the creator's slot is claimed (bound to the
+    // caller's user_id and device); all others are unclaimed (user_id NULL).
+    const rows = members.map((member) => ({
+      id: member.id,
       group_id: groupId,
-      display_name: displayName,
-      device_id: deviceId,
-      user_id: userId,
+      display_name: member.name,
+      device_id: member.id === creatorMemberId ? member.deviceId : null,
+      user_id: member.id === creatorMemberId ? userId : null,
       created_at: createdAt,
       updated_at: now,
       deleted_at: null
-    });
+    }));
+
+    const { error: memberError } = await supabase.from("members").insert(rows);
     if (memberError) throw memberError;
 
-    return json({ code: finalCode });
+    await applyOptionalPassword(supabase, groupId, body?.password);
+
+    return json({ code: finalCode, creatorMemberId });
   } catch (error) {
     return json({ error: getErrorMessage(error) }, 400);
   }
 });
+
+// Accepts either the new `members[]` + `creatorMemberId` shape or the legacy
+// single `member` shape, and returns a normalized member list.
+function normalizeMembers(body: CreateRequest | null): {
+  members: NormalizedMember[];
+  creatorMemberId: string;
+} {
+  if (body?.members && body.members.length > 0) {
+    const members = body.members
+      .map((member) => ({
+        id: member.id?.trim() ?? "",
+        name: (member.name ?? member.displayName)?.trim() || "Member",
+        deviceId: member.deviceId?.trim() || null
+      }))
+      .filter((member) => member.id);
+    const creatorMemberId = body.creatorMemberId?.trim() || members[0]?.id || "";
+    return { members, creatorMemberId };
+  }
+
+  const legacy = body?.member;
+  if (legacy?.id?.trim()) {
+    const id = legacy.id.trim();
+    return {
+      members: [
+        {
+          id,
+          name: legacy.displayName?.trim() || "Member",
+          deviceId: legacy.deviceId?.trim() || null
+        }
+      ],
+      creatorMemberId: id
+    };
+  }
+
+  return { members: [], creatorMemberId: "" };
+}
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -158,4 +233,30 @@ async function insertGroupWithUniqueCode(
   }
 
   throw new Error("Could not allocate a unique group code");
+}
+
+async function applyOptionalPassword(
+  // deno-lint-ignore no-explicit-any
+  supabase: any,
+  groupId: string,
+  rawPassword: string | null | undefined
+) {
+  const password = typeof rawPassword === "string" ? rawPassword.trim() : "";
+  if (!password) return;
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    throw new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+  }
+
+  const now = new Date().toISOString();
+  const passwordHash = await hashPassword(password);
+  const { error: upsertError } = await supabase
+    .from("group_secrets")
+    .upsert({ group_id: groupId, password_hash: passwordHash, updated_at: now }, { onConflict: "group_id" });
+  if (upsertError) throw upsertError;
+
+  const { error: groupError } = await supabase
+    .from("groups")
+    .update({ has_password: true, updated_at: now })
+    .eq("id", groupId);
+  if (groupError) throw groupError;
 }

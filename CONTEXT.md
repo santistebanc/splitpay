@@ -8,9 +8,17 @@ Offline-first bill splitting for groups of friends. This file records the projec
 A shared space, identified by a short join code, containing members and the expenses they split.
 _Avoid_: room, party, account
 
-**Member**:
-A participant in a group. Money math refers to a member by id; display names are presentation only.
+**Member** (also **slot**):
+A named place in a group that expenses attach to. Money math refers to a member by id; display names are presentation only. A member is **claimed** when bound to a user (`user_id` set) and **unclaimed** otherwise — an unclaimed slot is just a name that anyone in the group can record against and that a joiner can later claim.
 _Avoid_: user, person, friend (in code)
+
+**Claim**:
+Binding a user to a member slot (assigning its `user_id`). Only `create-group` (for the creator) and `join-group` (for a joiner) ever claim; it never happens through the generic sync path.
+_Avoid_: assign, take, occupy
+
+**User**:
+An anonymous identity (a Supabase auth uid) that may claim a member slot. Distinct from a member: a member can exist with no user (unclaimed).
+_Avoid_: account, member (they are not interchangeable)
 
 **Expense**:
 A single recorded cost: an amount in integer cents, who paid it, and which members it is split across.

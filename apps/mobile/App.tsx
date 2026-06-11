@@ -4,8 +4,8 @@ import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator, NativeStackNavigationProp } from "@react-navigation/native-stack";
 import * as Clipboard from "expo-clipboard";
 import { StatusBar } from "expo-status-bar";
-import { ArrowLeft, Check, ChevronRight, Copy, Plus, Settings, Users } from "lucide-react-native";
-import React, { useEffect, useState } from "react";
+import { ArrowLeft, Check, ChevronRight, Copy, Lock, Plus, Settings, User, UserCheck, Users, X } from "lucide-react-native";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -13,7 +13,9 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   StyleProp,
+  TextStyle,
   useColorScheme,
   View,
   ViewStyle
@@ -31,6 +33,7 @@ import {
 } from "react-native-paper";
 import {
   addExpense,
+  addMember,
   ActivityLog,
   Balance,
   createGroup,
@@ -38,16 +41,19 @@ import {
   Expense,
   fetchActivityLogs,
   fetchGroup,
+  GroupSlot,
   GroupState,
   JoinError,
   joinGroup,
   Member,
+  previewGroupMembers,
+  removeMember,
+  renameMember,
   setGroupPassword,
   subscribeToConnection,
   subscribeToGroup,
   updateExpense,
-  updateGroupName,
-  updateMemberName
+  updateGroupName
 } from "./src/api";
 import { splitActivitySummary, withoutLeadingActor } from "./src/activityText";
 import {
@@ -66,6 +72,8 @@ import {
   Settlement,
   settlementKey
 } from "./src/ledger";
+import { isGroupPasswordValid, MIN_GROUP_PASSWORD_LENGTH } from "./src/groupPassword";
+import { DEFAULT_MEMBER_NAME, DUPLICATE_MEMBER_NAME_ERROR, isMemberNameTaken } from "./src/memberNames";
 import { AppColors, darkColors, lightColors, spacing, typography } from "./src/theme";
 
 type RootStackParamList = {
@@ -79,7 +87,8 @@ type RootStackParamList = {
   Activity: undefined;
 };
 type Navigation = NativeStackNavigationProp<RootStackParamList>;
-type KnownGroup = { code: string; name: string };
+type SettingsSaving = "groupName" | "password" | "members" | null;
+
 type ButtonIcon = (props: { color: string; size: number }) => React.ReactNode;
 type ButtonVariant = "primary" | "secondary" | "danger";
 type ValueTone = "default" | "positive" | "negative";
@@ -114,8 +123,29 @@ const storageKeys = {
   deviceId: "splitpay.deviceId",
   profileName: "splitpay.profileName",
   lastGroupCode: "splitpay.lastGroupCode",
-  knownGroups: "splitpay.knownGroups"
+  knownGroups: "splitpay.knownGroups",
+  groupPassword: (code: string) => `splitpay.groupPassword.${code.toUpperCase()}`
 };
+
+function maskPassword(password: string) {
+  return "•".repeat(password.length);
+}
+
+function displayGroupPassword(storedPassword: string | null, hasPassword: boolean) {
+  if (storedPassword) return maskPassword(storedPassword);
+  if (hasPassword) return "••••••••";
+  return "Not set";
+}
+
+async function loadStoredGroupPassword(code: string) {
+  return AsyncStorage.getItem(storageKeys.groupPassword(code));
+}
+
+async function rememberStoredGroupPassword(code: string, password: string | null) {
+  const key = storageKeys.groupPassword(code);
+  if (password) await AsyncStorage.setItem(key, password);
+  else await AsyncStorage.removeItem(key);
+}
 
 export default function App() {
   const colorScheme = useColorScheme();
@@ -131,13 +161,12 @@ export default function App() {
   const [groupState, setGroupState] = useState<GroupState | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState<SettingsSaving>(null);
   const [expenseAmount, setExpenseAmount] = useState("");
   const [expenseName, setExpenseName] = useState("");
   const [paidByMemberId, setPaidByMemberId] = useState("");
   const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
   const [splitMemberIds, setSplitMemberIds] = useState<string[]>([]);
-  const [editedGroupName, setEditedGroupName] = useState("");
-  const [editedDisplayName, setEditedDisplayName] = useState("");
   const [knownGroups, setKnownGroups] = useState<KnownGroup[]>([]);
   const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
   const [isLoadingActivity, setIsLoadingActivity] = useState(false);
@@ -147,11 +176,23 @@ export default function App() {
   const [isOnline, setIsOnline] = useState(false);
   const [joinPassword, setJoinPassword] = useState("");
   const [joinNeedsPassword, setJoinNeedsPassword] = useState(false);
-  const [settingsPassword, setSettingsPassword] = useState("");
+  const [joinStep, setJoinStep] = useState<"code" | "pick">("code");
+  const [joinSlots, setJoinSlots] = useState<GroupSlot[]>([]);
+  const [joinSelectedMemberId, setJoinSelectedMemberId] = useState<string | null>(null);
+  const [joinCustomName, setJoinCustomName] = useState("");
+  const [storedGroupPassword, setStoredGroupPassword] = useState<string | null>(null);
 
   useEffect(() => {
     void boot();
   }, []);
+
+  useEffect(() => {
+    if (!groupState) {
+      setStoredGroupPassword(null);
+      return;
+    }
+    void loadStoredGroupPassword(groupState.group.code).then(setStoredGroupPassword);
+  }, [groupState?.group.code, groupState?.group.hasPassword]);
 
   useEffect(() => subscribeToConnection(setIsOnline), []);
 
@@ -176,7 +217,6 @@ export default function App() {
       const storedName = await AsyncStorage.getItem(storageKeys.profileName);
       if (storedName) {
         setDisplayName(storedName);
-        setEditedDisplayName(storedName);
       }
       setKnownGroups(await loadKnownGroups());
       const lastGroupCode = await AsyncStorage.getItem(storageKeys.lastGroupCode);
@@ -200,37 +240,57 @@ export default function App() {
     }
   }
 
-  async function handleCreateGroup(navigation: Navigation) {
+  async function handleCreateGroup(
+    navigation: Navigation,
+    members: { name: string; isMe: boolean }[],
+    password: string
+  ) {
     await saveProfile();
     await runSaving(async () => {
+      const trimmedPassword = password.trim();
       const state = await createGroup({
         name: groupName,
-        displayName,
+        members,
         deviceId,
-        currency: "EUR"
+        currency: "EUR",
+        password: trimmedPassword || null
       });
+      if (trimmedPassword) {
+        await rememberStoredGroupPassword(state.group.code, trimmedPassword);
+        setStoredGroupPassword(trimmedPassword);
+      }
       await rememberKnownGroup(state);
       await rememberLastGroup(state.group.code);
-      setGroupState(state);
+      setGroupState(
+        trimmedPassword
+          ? { ...state, group: { ...state.group, hasPassword: true } }
+          : state
+      );
       navigation.replace("GroupView");
     });
   }
 
-  async function handleJoinGroup(navigation: Navigation) {
-    await saveProfile();
+  function resetJoinFlow() {
+    setJoinPassword("");
+    setJoinNeedsPassword(false);
+    setJoinStep("code");
+    setJoinSlots([]);
+    setJoinSelectedMemberId(null);
+    setJoinCustomName("");
+  }
+
+  // Step 1: look up the group and reveal its member slots so the joiner can
+  // pick who they are (or choose to add a new name).
+  async function handleJoinContinue() {
     try {
       setIsSaving(true);
-      const state = await joinGroup(joinCode, {
-        displayName: displayName.trim() || "Friend",
-        deviceId,
-        password: joinPassword || undefined
-      });
-      await rememberKnownGroup(state);
-      await rememberLastGroup(state.group.code);
-      setGroupState(state);
-      setJoinPassword("");
+      const slots = await previewGroupMembers(joinCode, { password: joinPassword || undefined });
+      const firstAvailable = slots.find((slot) => !slot.claimed);
+      setJoinSlots(slots);
+      setJoinSelectedMemberId(firstAvailable ? firstAvailable.id : null);
+      setJoinCustomName(displayName.trim());
       setJoinNeedsPassword(false);
-      navigation.replace("GroupView");
+      setJoinStep("pick");
     } catch (error) {
       if (error instanceof JoinError && error.needsPassword) {
         setJoinNeedsPassword(true);
@@ -241,48 +301,132 @@ export default function App() {
     }
   }
 
-  async function handleSetGroupPassword(remove: boolean) {
+  // Step 2: claim the chosen slot (or create a new member) and enter the group.
+  async function handleJoinClaim(navigation: Navigation) {
+    const selectedSlot = joinSelectedMemberId
+      ? joinSlots.find((slot) => slot.id === joinSelectedMemberId)
+      : null;
+    const name = (selectedSlot?.name ?? joinCustomName).trim() || displayName.trim() || DEFAULT_MEMBER_NAME;
+
+    if (
+      !joinSelectedMemberId &&
+      isMemberNameTaken(
+        joinSlots.map((slot) => slot.name),
+        name
+      )
+    ) {
+      presentError(DUPLICATE_MEMBER_NAME_ERROR);
+      return;
+    }
+
+    try {
+      setIsSaving(true);
+      const state = await joinGroup(joinCode, {
+        displayName: name,
+        deviceId,
+        password: joinPassword || undefined,
+        memberId: joinSelectedMemberId ?? undefined
+      });
+      await AsyncStorage.setItem(storageKeys.profileName, name);
+      setDisplayName(name);
+      await rememberKnownGroup(state);
+      await rememberLastGroup(state.group.code);
+      if (joinPassword.trim() && state.group.hasPassword) {
+        await rememberStoredGroupPassword(state.group.code, joinPassword.trim());
+        setStoredGroupPassword(joinPassword.trim());
+      }
+      setGroupState(state);
+      resetJoinFlow();
+      navigation.replace("GroupView");
+    } catch (error) {
+      if (error instanceof JoinError && error.needsPassword) {
+        setJoinNeedsPassword(true);
+        setJoinStep("code");
+      } else {
+        // A slot may have just been taken by someone else — refresh the list.
+        try {
+          const slots = await previewGroupMembers(joinCode, { password: joinPassword || undefined });
+          setJoinSlots(slots);
+        } catch {
+          // Keep the existing list if the refresh fails.
+        }
+      }
+      presentError(error);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function handleAddMember(name: string) {
     if (!groupState) return;
-    await runSaving(async () => {
-      await setGroupPassword(groupState.group.code, remove ? null : settingsPassword);
-      setSettingsPassword("");
+    if (!name.trim()) return;
+    await runSettingsSaving("members", async () => {
+      const state = await addMember(groupState.group.code, name, deviceId);
+      setGroupState(state);
+    });
+  }
+
+  async function handleRemoveMember(memberId: string) {
+    if (!groupState) return;
+    await runSettingsSaving("members", async () => {
+      const state = await removeMember(groupState.group.code, memberId, deviceId);
+      setGroupState(state);
+    });
+  }
+
+  async function handleSaveGroupPassword(password: string | null) {
+    if (!groupState || !isOnline) return;
+
+    const hasPassword = groupState.group.hasPassword;
+    const trimmed = password?.trim() ?? "";
+    if (!trimmed && !hasPassword) return;
+
+    await runSettingsSaving("password", async () => {
+      await setGroupPassword(groupState.group.code, trimmed ? trimmed : null);
+      await rememberStoredGroupPassword(groupState.group.code, trimmed ? trimmed : null);
+      setStoredGroupPassword(trimmed ? trimmed : null);
       const state = await fetchGroup(groupState.group.code, deviceId);
       await rememberKnownGroup(state);
       setGroupState(state);
     });
   }
 
-  async function handleSaveSettings() {
+  async function handleSaveGroupName(nextGroupName: string) {
     if (!groupState) return;
+    const trimmed = nextGroupName.trim();
+    if (!trimmed || trimmed === groupState.group.name) return;
 
-    await runSaving(async () => {
-      let state = groupState;
-      const nextGroupName = editedGroupName.trim();
-      const nextDisplayName = editedDisplayName.trim() || "Friend";
+    await runSettingsSaving("groupName", async () => {
+      const state = await updateGroupName(groupState.group.code, trimmed, deviceId);
+      await rememberKnownGroup(state);
+      setGroupState(state);
+    });
+  }
 
-      if (nextGroupName !== groupState.group.name) {
-        state = await updateGroupName(groupState.group.code, nextGroupName, deviceId);
-        await rememberKnownGroup(state);
-        setGroupState(state);
+  async function handleRenameMember(memberId: string, nextName: string) {
+    if (!groupState) return;
+    const member = groupState.members.find((entry) => entry.id === memberId);
+    if (!member) return;
+
+    const trimmed = nextName.trim() || DEFAULT_MEMBER_NAME;
+    if (trimmed === member.displayName) return;
+
+    const isCurrent = memberId === groupState.currentMemberId;
+    if (!isCurrent && member.claimed) return;
+
+    await runSettingsSaving("members", async () => {
+      const state = await renameMember(groupState.group.code, memberId, trimmed, deviceId);
+      if (isCurrent) {
+        await AsyncStorage.setItem(storageKeys.profileName, trimmed);
+        setDisplayName(trimmed);
       }
-
-      if (nextDisplayName !== displayName) {
-        state = await updateMemberName(state.group.code, nextDisplayName, deviceId);
-        await AsyncStorage.setItem(storageKeys.profileName, nextDisplayName);
-        setDisplayName(nextDisplayName);
-        setEditedDisplayName(nextDisplayName);
-        await rememberKnownGroup(state);
-        setGroupState(state);
-      }
+      await rememberKnownGroup(state);
+      setGroupState(state);
     });
   }
 
   function openSettings(navigation: Navigation) {
     if (!groupState) return;
-    const currentMemberName =
-      groupState.members.find((member) => member.id === groupState.currentMemberId)?.displayName ?? displayName;
-    setEditedGroupName(groupState.group.name);
-    setEditedDisplayName(currentMemberName);
     navigation.navigate("Settings");
   }
 
@@ -343,6 +487,7 @@ export default function App() {
     await AsyncStorage.setItem(storageKeys.knownGroups, JSON.stringify(nextGroups));
 
     if (groupState?.group.code !== code) return;
+    await rememberStoredGroupPassword(code, null);
 
     if (nextGroups.length === 0) {
       setGroupState(null);
@@ -456,7 +601,6 @@ export default function App() {
   async function saveProfile() {
     const name = displayName.trim();
     if (name) {
-      setEditedDisplayName(name);
       await AsyncStorage.setItem(storageKeys.profileName, name);
     }
   }
@@ -496,8 +640,26 @@ export default function App() {
     }
   }
 
+  async function runSettingsSaving(scope: SettingsSaving, action: () => Promise<void>) {
+    try {
+      setSettingsSaving(scope);
+      setIsSaving(true);
+      await action();
+    } catch (error) {
+      presentError(error);
+    } finally {
+      setIsSaving(false);
+      setSettingsSaving(null);
+    }
+  }
+
   function presentError(error: unknown) {
     setErrorMessage(getErrorMessage(error));
+  }
+
+  async function copyGroupCode(code: string) {
+    await Clipboard.setStringAsync(code);
+    Alert.alert("Code copied", code);
   }
 
   function withTimeout<T>(promise: Promise<T>, ms: number) {
@@ -542,6 +704,7 @@ export default function App() {
                 onNewGroup={() => navigation.navigate("NewGroup")}
                 onJoinGroup={() => navigation.navigate("JoinGroup")}
                 onSelectGroup={(code) => handleSelectGroup(code, navigation)}
+                onCopyCode={copyGroupCode}
               />
             )}
           </Stack.Screen>
@@ -551,9 +714,10 @@ export default function App() {
                 groupName={groupName}
                 displayName={displayName}
                 isSaving={isSaving}
+                isOnline={isOnline}
                 onGroupNameChange={setGroupName}
                 onNameChange={setDisplayName}
-                onCreate={() => handleCreateGroup(navigation)}
+                onCreate={(members, password) => handleCreateGroup(navigation, members, password)}
                 onBack={() => goBackOr(navigation, "Groups")}
               />
             )}
@@ -561,20 +725,34 @@ export default function App() {
           <Stack.Screen name="JoinGroup">
             {({ navigation }) => (
               <JoinGroupScreen
+                step={joinStep}
                 joinCode={joinCode}
                 displayName={displayName}
                 isSaving={isSaving}
                 isOnline={isOnline}
                 password={joinPassword}
                 needsPassword={joinNeedsPassword}
+                slots={joinSlots}
+                selectedMemberId={joinSelectedMemberId}
+                customName={joinCustomName}
                 onCodeChange={(value) => {
                   setJoinCode(value);
                   setJoinNeedsPassword(false);
                 }}
                 onPasswordChange={setJoinPassword}
                 onNameChange={setDisplayName}
-                onJoin={() => handleJoinGroup(navigation)}
-                onBack={() => goBackOr(navigation, "Groups")}
+                onContinue={handleJoinContinue}
+                onSelectSlot={setJoinSelectedMemberId}
+                onCustomNameChange={setJoinCustomName}
+                onClaim={() => handleJoinClaim(navigation)}
+                onBack={() => {
+                  if (joinStep === "pick") {
+                    setJoinStep("code");
+                  } else {
+                    resetJoinFlow();
+                    goBackOr(navigation, "Groups");
+                  }
+                }}
               />
             )}
           </Stack.Screen>
@@ -583,10 +761,7 @@ export default function App() {
               groupState ? (
                 <GroupViewScreen
                   groupState={groupState}
-                  onShare={async () => {
-                    await Clipboard.setStringAsync(groupState.group.code);
-                    Alert.alert("Code copied", groupState.group.code);
-                  }}
+                  onShare={() => copyGroupCode(groupState.group.code)}
                   onExpense={() => startNewExpense(navigation)}
                   onSettle={() => navigation.navigate("Settle")}
                   onBack={() => goBackOr(navigation, "Groups")}
@@ -601,6 +776,7 @@ export default function App() {
                   onNewGroup={() => navigation.navigate("NewGroup")}
                   onJoinGroup={() => navigation.navigate("JoinGroup")}
                   onSelectGroup={(code) => handleSelectGroup(code, navigation)}
+                  onCopyCode={copyGroupCode}
                 />
               )
             }
@@ -622,21 +798,16 @@ export default function App() {
               groupState ? (
                 <SettingsScreen
                   groupState={groupState}
-                  displayName={editedDisplayName}
-                  groupName={editedGroupName}
                   isSaving={isSaving}
+                  settingsSaving={settingsSaving}
                   isOnline={isOnline}
-                  password={settingsPassword}
-                  onPasswordChange={setSettingsPassword}
-                  onSetPassword={() => handleSetGroupPassword(false)}
-                  onRemovePassword={() => handleSetGroupPassword(true)}
-                  onShare={async () => {
-                    await Clipboard.setStringAsync(groupState.group.code);
-                    Alert.alert("Code copied", groupState.group.code);
-                  }}
-                  onGroupNameChange={setEditedGroupName}
-                  onDisplayNameChange={setEditedDisplayName}
-                  onSave={handleSaveSettings}
+                  onAddMember={handleAddMember}
+                  onRemoveMember={handleRemoveMember}
+                  onRenameMember={handleRenameMember}
+                  onShare={() => copyGroupCode(groupState.group.code)}
+                  onGroupNameSave={handleSaveGroupName}
+                  onPasswordSave={handleSaveGroupPassword}
+                  storedGroupPassword={storedGroupPassword}
                   onActivity={() => openActivity(navigation)}
                   onExit={() => handleExitGroup(groupState.group.code, navigation)}
                   onBack={() => goBackOr(navigation, "GroupView")}
@@ -649,6 +820,7 @@ export default function App() {
                   onNewGroup={() => navigation.navigate("NewGroup")}
                   onJoinGroup={() => navigation.navigate("JoinGroup")}
                   onSelectGroup={(code) => handleSelectGroup(code, navigation)}
+                  onCopyCode={copyGroupCode}
                 />
               )
             }
@@ -719,11 +891,75 @@ function NewGroupScreen(props: {
   groupName: string;
   displayName: string;
   isSaving: boolean;
+  isOnline: boolean;
   onGroupNameChange: (value: string) => void;
   onNameChange: (value: string) => void;
-  onCreate: () => void;
+  onCreate: (members: { name: string; isMe: boolean }[], password: string) => void;
   onBack: () => void;
 }) {
+  const creatorIdRef = useRef(`draft_creator_${Date.now().toString(36)}`);
+  const [password, setPassword] = useState("");
+  const [members, setMembers] = useState<MemberListEntry[]>(() => [
+    {
+      id: creatorIdRef.current,
+      displayName: props.displayName.trim() || DEFAULT_MEMBER_NAME,
+      isCurrent: true,
+      claimed: true
+    }
+  ]);
+
+  useEffect(() => {
+    if (!props.displayName.trim()) {
+      props.onNameChange(DEFAULT_MEMBER_NAME);
+    }
+  }, []);
+
+  useEffect(() => {
+    setMembers((current) =>
+      current.map((member) =>
+        member.isCurrent ? { ...member, displayName: props.displayName.trim() || DEFAULT_MEMBER_NAME } : member
+      )
+    );
+  }, [props.displayName]);
+
+  async function handleAddMember(name: string) {
+    setMembers((current) => [
+      ...current,
+      {
+        id: draftMemberId(),
+        displayName: name,
+        isCurrent: false,
+        claimed: false
+      }
+    ]);
+  }
+
+  function handleRemoveMember(memberId: string) {
+    setMembers((current) => current.filter((member) => member.id !== memberId));
+  }
+
+  async function handleRenameMember(memberId: string, name: string) {
+    if (memberId === creatorIdRef.current) {
+      props.onNameChange(name);
+    }
+    setMembers((current) =>
+      current.map((entry) => (entry.id === memberId ? { ...entry, displayName: name } : entry))
+    );
+  }
+
+  const create = () => {
+    const payload = members
+      .map((member) => ({
+        name: member.displayName.trim() || DEFAULT_MEMBER_NAME,
+        isMe: member.isCurrent
+      }))
+      .filter((member) => member.isMe || member.name.length > 0);
+    props.onCreate(payload, password);
+  };
+
+  const passwordInvalid = password.trim().length > 0 && !isGroupPasswordValid(password);
+  const canCreate = !passwordInvalid;
+
   return (
     <Page title="New group" onBack={props.onBack}>
       <LabeledInput
@@ -733,25 +969,135 @@ function NewGroupScreen(props: {
         placeholder="Lisbon trip"
         onChangeText={props.onGroupNameChange}
       />
-      <LabeledInput label="Your name" value={props.displayName} placeholder="Alex" onChangeText={props.onNameChange} />
-      <ActionButton icon={({ color, size }) => <Users color={color} size={size} />} label="Create" loading={props.isSaving} onPress={props.onCreate} />
+      <MembersSection
+        members={members}
+        isSaving={props.isSaving}
+        membersSaving={false}
+        onAddMember={handleAddMember}
+        onRemoveMember={handleRemoveMember}
+        onRenameMember={handleRenameMember}
+      />
+      <View style={styles.panel}>
+        <LabeledInput
+          label="Group password (optional)"
+          value={password}
+          placeholder={`At least ${MIN_GROUP_PASSWORD_LENGTH} characters`}
+          secureTextEntry
+          autoCapitalize="none"
+          autoCorrect={false}
+          onChangeText={setPassword}
+        />
+      </View>
+      {passwordInvalid ? (
+        <Text style={styles.fieldError}>
+          Password must be at least {MIN_GROUP_PASSWORD_LENGTH} characters
+        </Text>
+      ) : null}
+      {password.trim() && !props.isOnline ? (
+        <OfflineNotice action="Setting a group password" />
+      ) : null}
+      <ActionButton
+        icon={({ color, size }) => <Users color={color} size={size} />}
+        label="Create"
+        loading={props.isSaving}
+        disabled={!canCreate}
+        onPress={create}
+      />
     </Page>
   );
 }
 
 function JoinGroupScreen(props: {
+  step: "code" | "pick";
   joinCode: string;
   displayName: string;
   isSaving: boolean;
   isOnline: boolean;
   password: string;
   needsPassword: boolean;
+  slots: GroupSlot[];
+  selectedMemberId: string | null;
+  customName: string;
   onCodeChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
   onNameChange: (value: string) => void;
-  onJoin: () => void;
+  onContinue: () => void;
+  onSelectSlot: (memberId: string | null) => void;
+  onCustomNameChange: (value: string) => void;
+  onClaim: () => void;
   onBack: () => void;
 }) {
+  if (props.step === "pick") {
+    const usingCustom = props.selectedMemberId === null;
+    const orderedSlots = sortJoinSlotsForDisplay(props.slots);
+    const customNameDuplicate =
+      usingCustom &&
+      isMemberNameTaken(
+        props.slots.map((slot) => slot.name),
+        props.customName
+      );
+    const canJoin =
+      props.isOnline &&
+      (!usingCustom || (props.customName.trim().length > 0 && !customNameDuplicate));
+    return (
+      <Page title="Who are you?" onBack={props.onBack}>
+        <Text style={styles.sectionLabel}>Pick your name</Text>
+        <View style={styles.panel}>
+          {orderedSlots.map((slot) => (
+            <TactilePressable
+              key={slot.id}
+              disabled={slot.claimed}
+              style={[
+                styles.pickRow,
+                slot.claimed && styles.pickRowTaken,
+                !slot.claimed && props.selectedMemberId === slot.id && styles.listItemSelected
+              ]}
+              onPress={() => props.onSelectSlot(slot.id)}
+            >
+              <MemberIdentityBadge name={slot.name} isCurrent={false} claimed={slot.claimed} />
+              <Text style={[styles.pickName, slot.claimed && styles.pickNameTaken]} numberOfLines={1}>
+                {slot.name}
+              </Text>
+              {slot.claimed ? (
+                <Lock color={colors.iconMuted} size={17} strokeWidth={2.2} />
+              ) : props.selectedMemberId === slot.id ? (
+                <Check color={colors.primary} size={20} />
+              ) : null}
+            </TactilePressable>
+          ))}
+          <View style={[styles.pickRow, usingCustom && styles.listItemSelected]}>
+            {usingCustom ? (
+              <TextInput
+                value={props.customName}
+                onChangeText={props.onCustomNameChange}
+                autoFocus
+                placeholder="Alex"
+                placeholderTextColor={colors.iconMuted}
+                returnKeyType="done"
+                onSubmitEditing={canJoin ? props.onClaim : undefined}
+                style={[styles.joinCustomNameInput, customNameDuplicate && styles.joinCustomNameInputError]}
+                selectionColor={colors.primary}
+              />
+            ) : (
+              <TactilePressable style={styles.pickRowPressable} onPress={() => props.onSelectSlot(null)}>
+                <Text style={styles.pickName}>Someone else</Text>
+              </TactilePressable>
+            )}
+            {usingCustom ? <Check color={colors.primary} size={20} /> : null}
+          </View>
+        </View>
+        {customNameDuplicate ? <Text style={styles.fieldError}>{DUPLICATE_MEMBER_NAME_ERROR}</Text> : null}
+        <ActionButton
+          icon={({ color, size }) => <Check color={color} size={size} />}
+          label="Join"
+          loading={props.isSaving}
+          disabled={!canJoin}
+          onPress={props.onClaim}
+        />
+      </Page>
+    );
+  }
+
   return (
     <Page title="Join group" onBack={props.onBack}>
       <LabeledInput
@@ -762,12 +1108,6 @@ function JoinGroupScreen(props: {
         maxLength={5}
         autoCapitalize="characters"
         onChangeText={(value) => props.onCodeChange(value.toUpperCase())}
-      />
-      <LabeledInput
-        label="Your name"
-        value={props.displayName}
-        placeholder="Alex"
-        onChangeText={props.onNameChange}
       />
       {props.needsPassword ? (
         <LabeledInput
@@ -781,11 +1121,11 @@ function JoinGroupScreen(props: {
       ) : null}
       {props.isOnline ? null : <OfflineNotice action="Joining a group" />}
       <ActionButton
-        icon={({ color, size }) => <Check color={color} size={size} />}
-        label="Join"
+        icon={({ color, size }) => <ChevronRight color={color} size={size} />}
+        label="Continue"
         loading={props.isSaving}
-        disabled={!props.isOnline}
-        onPress={props.onJoin}
+        disabled={!props.isOnline || props.joinCode.trim().length === 0}
+        onPress={props.onContinue}
       />
     </Page>
   );
@@ -825,7 +1165,11 @@ function GroupViewScreen({
         <ActionButton icon={({ color, size }) => <Plus color={color} size={size} />} label="Add" onPress={onExpense} />
         {hasSettlements ? <ActionButton compact variant="secondary" label="Settle" onPress={onSettle} /> : null}
       </View>
-      <Balances balances={groupState.balances} currency={groupState.group.currency} />
+      <Balances
+        balances={groupState.balances}
+        currency={groupState.group.currency}
+        currentMemberId={groupState.currentMemberId}
+      />
       <Expenses
         expenses={groupState.expenses}
         members={groupState.members}
@@ -843,26 +1187,26 @@ function GroupsScreen(props: {
   onNewGroup: () => void;
   onJoinGroup: () => void;
   onSelectGroup: (code: string) => void;
+  onCopyCode: (code: string) => void;
 }) {
   return (
     <Page contentStyle={styles.centeredPageContent}>
       <View style={styles.groupsCenterBlock}>
         <AppLogo />
-        <View style={styles.panel}>
-          {props.knownGroups.length === 0 ? (
-            <Text style={styles.emptyText}>No groups yet.</Text>
-          ) : (
-            props.knownGroups.map((knownGroup) => (
+        {props.knownGroups.length > 0 ? (
+          <View style={styles.panel}>
+            {props.knownGroups.map((knownGroup) => (
               <GroupListItem
                 key={knownGroup.code}
                 group={knownGroup}
                 isCurrent={knownGroup.code === props.currentGroupCode}
                 isLoading={knownGroup.code === props.loadingGroupCode}
                 onPress={() => props.onSelectGroup(knownGroup.code)}
+                onCopyCode={() => props.onCopyCode(knownGroup.code)}
               />
-            ))
-          )}
-        </View>
+            ))}
+          </View>
+        ) : null}
 
         <View style={styles.buttonRow}>
           <ActionButton icon={({ color, size }) => <Users color={color} size={size} />} label="New Group" onPress={props.onNewGroup} />
@@ -877,12 +1221,14 @@ function GroupListItem({
   group,
   isCurrent,
   isLoading,
-  onPress
+  onPress,
+  onCopyCode
 }: {
   group: KnownGroup;
   isCurrent: boolean;
   isLoading: boolean;
   onPress: () => void;
+  onCopyCode: () => void;
 }) {
   return (
     <TactilePressable
@@ -898,9 +1244,15 @@ function GroupListItem({
         <Text style={styles.listTitle} numberOfLines={2}>
           {group.name}
         </Text>
-        <Text style={styles.meta} numberOfLines={1}>
-          {group.code}
-        </Text>
+        <TactilePressable
+          accessibilityLabel="Copy group code"
+          style={styles.groupCodePressable}
+          onPress={onCopyCode}
+        >
+          <Text style={styles.meta} numberOfLines={1}>
+            {group.code}
+          </Text>
+        </TactilePressable>
       </View>
       <View style={styles.rowAccessory}>
         {
@@ -956,31 +1308,296 @@ function AppLogo() {
   );
 }
 
+function MemberIdentityBadge(props: { name: string; isCurrent: boolean; claimed: boolean }) {
+  if (props.isCurrent) {
+    return (
+      <View style={[styles.memberAvatar, styles.memberAvatarYou]}>
+        <Text style={styles.memberAvatarInitial}>{props.name.slice(0, 1).toUpperCase()}</Text>
+      </View>
+    );
+  }
+
+  if (props.claimed) {
+    return (
+      <View style={[styles.memberAvatar, styles.memberAvatarClaimed]}>
+        <UserCheck color={colors.primary} size={15} strokeWidth={2.4} />
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.memberAvatar, styles.memberAvatarOpen]}>
+      <User color={colors.iconMuted} size={15} strokeWidth={2} />
+    </View>
+  );
+}
+
+function MemberListName(props: {
+  value: string;
+  placeholder: string;
+  editable: boolean;
+  saving: boolean;
+  deleteOnEmpty?: boolean;
+  textStyle?: StyleProp<TextStyle>;
+  youSuffix?: boolean;
+  onSave: (nextValue: string) => void | Promise<void>;
+  onDelete?: () => void | Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(props.value);
+  const committingRef = useRef(false);
+
+  useEffect(() => {
+    if (!editing) setDraft(props.value);
+  }, [props.value, editing]);
+
+  async function commit() {
+    if (committingRef.current || props.saving || !props.editable) return;
+    committingRef.current = true;
+    const trimmed = draft.trim();
+    setEditing(false);
+    try {
+      if (props.deleteOnEmpty && !trimmed) {
+        await props.onDelete?.();
+        setDraft(props.value);
+        return;
+      }
+      const next = props.deleteOnEmpty ? trimmed : trimmed || props.placeholder;
+      if (next !== props.value.trim()) {
+        await props.onSave(next);
+      } else {
+        setDraft(props.value);
+      }
+    } finally {
+      committingRef.current = false;
+    }
+  }
+
+  function startEditing() {
+    if (!props.editable || props.saving || editing) return;
+    setDraft(props.value);
+    setEditing(true);
+  }
+
+  if (!props.editable) {
+    return (
+      <Text style={props.textStyle} numberOfLines={1}>
+        {props.value}
+      </Text>
+    );
+  }
+
+  if (editing) {
+    return (
+      <TextInput
+        value={draft}
+        onChangeText={setDraft}
+        autoFocus
+        placeholder={props.deleteOnEmpty ? undefined : props.placeholder}
+        placeholderTextColor={props.deleteOnEmpty ? undefined : colors.iconMuted}
+        returnKeyType="done"
+        onSubmitEditing={() => void commit()}
+        onBlur={() => void commit()}
+        style={styles.memberListNameInput}
+        selectionColor={colors.primary}
+      />
+    );
+  }
+
+  return (
+    <Pressable style={styles.memberListNamePressable} onPress={startEditing} disabled={props.saving}>
+      <Text style={props.textStyle} numberOfLines={1}>
+        {props.value}
+        {props.youSuffix ? <Text style={styles.currentUserYouSuffix}>{"  (you)"}</Text> : null}
+      </Text>
+    </Pressable>
+  );
+}
+
+type MemberListEntry = {
+  id: string;
+  displayName: string;
+  isCurrent: boolean;
+  claimed: boolean;
+};
+
+function MembersSection(props: {
+  members: MemberListEntry[];
+  isSaving: boolean;
+  membersSaving: boolean;
+  onAddMember: (name: string) => void | Promise<void>;
+  onRemoveMember: (memberId: string) => void;
+  onRenameMember: (memberId: string, name: string) => void | Promise<void>;
+}) {
+  const [isAdding, setIsAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [addError, setAddError] = useState("");
+  const committingRef = useRef(false);
+  const cancelRef = useRef(false);
+
+  async function commit(keepOpen: boolean) {
+    if (cancelRef.current) {
+      cancelRef.current = false;
+      return;
+    }
+    if (committingRef.current || props.isSaving) return;
+    committingRef.current = true;
+    const name = draft.trim();
+    try {
+      if (!name) {
+        setIsAdding(false);
+        setDraft("");
+        setAddError("");
+        return;
+      }
+      if (isMemberNameTaken(props.members.map((member) => member.displayName), name)) {
+        setAddError(DUPLICATE_MEMBER_NAME_ERROR);
+        return;
+      }
+      setAddError("");
+      await props.onAddMember(name);
+      setDraft("");
+      if (!keepOpen) setIsAdding(false);
+    } finally {
+      committingRef.current = false;
+    }
+  }
+
+  function startAdding() {
+    if (props.isSaving) return;
+    setIsAdding(true);
+    setDraft("");
+    setAddError("");
+  }
+
+  function cancelAdding() {
+    cancelRef.current = true;
+    setIsAdding(false);
+    setDraft("");
+    setAddError("");
+  }
+
+  const orderedMembers = sortMemberListForDisplay(props.members);
+
+  return (
+    <>
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionLabelInline}>Members</Text>
+        {isAdding ? null : (
+          <TactilePressable
+            accessibilityLabel="Add member"
+            style={styles.sectionAddButton}
+            onPress={startAdding}
+            disabled={props.isSaving}
+          >
+            <Plus color={colors.primary} size={18} strokeWidth={2.5} />
+            <Text style={styles.sectionAddLabel}>Add</Text>
+          </TactilePressable>
+        )}
+      </View>
+      <View style={styles.panel}>
+        {orderedMembers.map((member) => {
+          const canRename = member.isCurrent || !member.claimed;
+          return (
+            <View key={member.id} style={[styles.pickRow, member.isCurrent && styles.listItemSelected]}>
+              <MemberIdentityBadge
+                name={member.displayName}
+                isCurrent={member.isCurrent}
+                claimed={member.claimed}
+              />
+              <MemberListName
+                value={member.displayName}
+                placeholder={DEFAULT_MEMBER_NAME}
+                editable={canRename}
+                saving={props.membersSaving}
+                deleteOnEmpty={!member.isCurrent && !member.claimed}
+                youSuffix={member.isCurrent}
+                textStyle={[
+                  styles.pickName,
+                  member.isCurrent && styles.currentUserName,
+                  !member.isCurrent && !member.claimed && styles.memberNameUnclaimed
+                ]}
+                onSave={(name) => props.onRenameMember(member.id, name)}
+                onDelete={() => props.onRemoveMember(member.id)}
+              />
+            </View>
+          );
+        })}
+        {isAdding ? (
+          <View style={styles.memberAddBlock}>
+            <View style={styles.memberAddRow}>
+              <TextInput
+                value={draft}
+                onChangeText={(value) => {
+                  setDraft(value);
+                  if (addError) setAddError("");
+                }}
+                autoFocus
+                editable={!props.isSaving}
+                placeholder={DEFAULT_MEMBER_NAME}
+                placeholderTextColor={colors.iconMuted}
+                returnKeyType="done"
+                onSubmitEditing={() => void commit(true)}
+                onBlur={() => void commit(false)}
+                style={[styles.memberAddInput, addError ? styles.memberAddInputError : null]}
+                selectionColor={colors.primary}
+              />
+              <BareIconButton label="Cancel adding member" onPress={cancelAdding}>
+                <X color={colors.muted} size={20} />
+              </BareIconButton>
+            </View>
+            {addError ? <Text style={styles.fieldError}>{addError}</Text> : null}
+          </View>
+        ) : null}
+      </View>
+    </>
+  );
+}
+
 function SettingsScreen(props: {
   groupState: GroupState;
-  displayName: string;
-  groupName: string;
   isSaving: boolean;
+  settingsSaving: SettingsSaving;
   isOnline: boolean;
-  password: string;
-  onPasswordChange: (value: string) => void;
-  onSetPassword: () => void;
-  onRemovePassword: () => void;
+  onAddMember: (name: string) => void | Promise<void>;
+  onRemoveMember: (memberId: string) => void;
+  onRenameMember: (memberId: string, name: string) => void | Promise<void>;
   onShare: () => void;
-  onGroupNameChange: (value: string) => void;
-  onDisplayNameChange: (value: string) => void;
-  onSave: () => void;
+  onGroupNameSave: (value: string) => void | Promise<void>;
+  onPasswordSave: (password: string | null) => void | Promise<void>;
+  storedGroupPassword: string | null;
   onActivity: () => void;
   onExit: () => void;
   onBack: () => void;
 }) {
   const hasPassword = props.groupState.group.hasPassword;
+  const currentMemberId = props.groupState.currentMemberId;
 
   return (
     <Page title="Settings" onBack={props.onBack}>
-      <LabeledInput label="Group name" value={props.groupName} placeholder="Lisbon trip" onChangeText={props.onGroupNameChange} />
-      <LabeledInput label="Your name" value={props.displayName} placeholder="Alex" onChangeText={props.onDisplayNameChange} />
-      <ActionButton icon={({ color, size }) => <Check color={color} size={size} />} label="Save" loading={props.isSaving} onPress={props.onSave} />
+      <View style={styles.panel}>
+        <InlineEditableField
+          label="Group name"
+          value={props.groupState.group.name}
+          placeholder="Lisbon trip"
+          saving={props.settingsSaving === "groupName"}
+          onSave={props.onGroupNameSave}
+        />
+      </View>
+
+      <MembersSection
+        members={props.groupState.members.map((member) => ({
+          id: member.id,
+          displayName: member.displayName,
+          isCurrent: member.id === currentMemberId,
+          claimed: member.claimed
+        }))}
+        isSaving={props.isSaving}
+        membersSaving={props.settingsSaving === "members"}
+        onAddMember={props.onAddMember}
+        onRemoveMember={props.onRemoveMember}
+        onRenameMember={props.onRenameMember}
+      />
 
       <View style={styles.panel}>
         <SettingRow
@@ -989,10 +1606,13 @@ function SettingsScreen(props: {
           onPress={props.onShare}
           accessory="copy"
         />
-        <SettingRow
-          label="Password"
-          value={hasPassword ? "On" : "Off"}
-          accessory="none"
+        <InlineEditablePassword
+          hasPassword={hasPassword}
+          storedPassword={props.storedGroupPassword}
+          isOnline={props.isOnline}
+          saving={props.settingsSaving === "password"}
+          disabled={props.isSaving}
+          onSave={props.onPasswordSave}
         />
         <SettingRow
           label="Activity log"
@@ -1000,30 +1620,7 @@ function SettingsScreen(props: {
           onPress={props.onActivity}
         />
       </View>
-
-      <LabeledInput
-        label={hasPassword ? "Change password" : "Set a group password"}
-        value={props.password}
-        placeholder="New password"
-        secureTextEntry
-        autoCapitalize="none"
-        onChangeText={props.onPasswordChange}
-      />
-      {props.isOnline ? null : <OfflineNotice action="Changing the password" />}
-      <ActionButton
-        label={hasPassword ? "Update password" : "Set password"}
-        loading={props.isSaving}
-        disabled={!props.isOnline || props.password.trim().length === 0}
-        onPress={props.onSetPassword}
-      />
-      {hasPassword ? (
-        <ActionButton
-          variant="secondary"
-          label="Remove password"
-          disabled={!props.isOnline}
-          onPress={props.onRemovePassword}
-        />
-      ) : null}
+      {props.isOnline ? null : <OfflineNotice action="Changing the group password" />}
 
       <ActionButton variant="danger" label="Exit group" onPress={props.onExit} />
     </Page>
@@ -1139,6 +1736,176 @@ function SettleSummary({ fromName, toName }: { fromName: string; toName: string 
   );
 }
 
+function InlineEditableField({
+  label,
+  value,
+  placeholder,
+  saving = false,
+  onSave
+}: {
+  label: string;
+  value: string;
+  placeholder: string;
+  saving?: boolean;
+  onSave: (nextValue: string) => void | Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const committingRef = useRef(false);
+
+  useEffect(() => {
+    if (!editing) setDraft(value);
+  }, [value, editing]);
+
+  async function commit() {
+    if (committingRef.current || saving) return;
+    committingRef.current = true;
+    const next = draft.trim() || placeholder;
+    setEditing(false);
+    try {
+      if (next !== value.trim()) {
+        await onSave(next);
+      } else {
+        setDraft(value);
+      }
+    } finally {
+      committingRef.current = false;
+    }
+  }
+
+  function startEditing() {
+    if (saving || editing) return;
+    setDraft(value);
+    setEditing(true);
+  }
+
+  return (
+    <Pressable
+      style={[styles.inlineEditableRow, editing && styles.inlineEditableRowActive]}
+      onPress={startEditing}
+      disabled={editing || saving}
+    >
+      <Text style={styles.inlineEditableLabel}>{label}</Text>
+      {editing ? (
+        <TextInput
+          value={draft}
+          onChangeText={setDraft}
+          autoFocus
+          placeholder={placeholder}
+          placeholderTextColor={colors.iconMuted}
+          returnKeyType="done"
+          onSubmitEditing={() => void commit()}
+          onBlur={() => void commit()}
+          style={styles.inlineEditableInput}
+          selectionColor={colors.primary}
+        />
+      ) : (
+        <View style={styles.inlineEditableValueRow}>
+          <Text
+            style={[styles.inlineEditableValue, !value && styles.inlineEditablePlaceholder]}
+            numberOfLines={2}
+          >
+            {value || placeholder}
+          </Text>
+          {saving ? <ActivityIndicator color={colors.primary} size="small" /> : null}
+        </View>
+      )}
+    </Pressable>
+  );
+}
+
+function InlineEditablePassword(props: {
+  hasPassword: boolean;
+  storedPassword: string | null;
+  isOnline: boolean;
+  saving: boolean;
+  disabled: boolean;
+  onSave: (password: string | null) => void | Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const committingRef = useRef(false);
+
+  async function commit() {
+    if (committingRef.current || props.disabled) return;
+    committingRef.current = true;
+    const trimmed = draft.trim();
+    try {
+      if (!trimmed) {
+        if (props.hasPassword) await props.onSave(null);
+        setEditing(false);
+        setDraft("");
+        return;
+      }
+      if (trimmed === (props.storedPassword ?? "") && props.hasPassword) {
+        setEditing(false);
+        setDraft(props.storedPassword ?? "");
+        return;
+      }
+      await props.onSave(trimmed);
+      setEditing(false);
+      setDraft("");
+    } finally {
+      committingRef.current = false;
+    }
+  }
+
+  function startEditing() {
+    if (!props.isOnline || props.disabled || editing || props.saving) return;
+    setDraft(props.storedPassword ?? "");
+    setEditing(true);
+  }
+
+  const maskedValue = displayGroupPassword(props.storedPassword, props.hasPassword);
+
+  if (editing || props.saving) {
+    return (
+      <View style={[styles.settingRow, styles.settingRowEditing]}>
+        <Text style={styles.settingLabel}>Group password</Text>
+        <View style={styles.inlinePasswordEditingWrap}>
+          <TextInput
+            value={draft}
+            onChangeText={setDraft}
+            autoFocus={!props.saving}
+            editable={!props.saving}
+            secureTextEntry
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="done"
+            onSubmitEditing={() => void commit()}
+            onBlur={() => {
+              if (!props.saving) void commit();
+            }}
+            style={styles.inlinePasswordInput}
+            selectionColor={colors.primary}
+          />
+          {props.saving ? (
+            <ActivityIndicator color={colors.primary} size="small" />
+          ) : null}
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <TactilePressable
+      style={styles.settingRow}
+      onPress={startEditing}
+      disabled={!props.isOnline || props.disabled}
+    >
+      <Text style={styles.settingLabel}>Group password</Text>
+      <View style={styles.settingValueWrap}>
+        <Text
+          style={[styles.settingValue, !props.hasPassword && styles.settingValueMuted]}
+          numberOfLines={1}
+        >
+          {maskedValue}
+        </Text>
+      </View>
+    </TactilePressable>
+  );
+}
+
 function SettingRow({
   label,
   value,
@@ -1195,7 +1962,10 @@ function ExpenseScreen(props: {
   onDelete: () => void;
   onBack: () => void;
 }) {
-  const paidByMembers = currentMemberFirst(props.groupState.members, props.groupState.currentMemberId);
+  const orderedMembers = sortMembersForDisplay(
+    props.groupState.members,
+    props.groupState.currentMemberId
+  );
   const selectedPayerId = props.paidByMemberId || preferredPayerId(props.groupState);
 
   return (
@@ -1206,11 +1976,12 @@ function ExpenseScreen(props: {
         <View style={styles.selectorBlock}>
           <Text style={styles.label}>Paid for</Text>
           <View style={styles.chipWrap}>
-            {props.groupState.members.map((member) => (
+            {orderedMembers.map((member) => (
               <Chip
                 key={member.id}
                 label={member.displayName}
                 selected={props.splitMemberIds.includes(member.id)}
+                isCurrent={member.id === props.groupState.currentMemberId}
                 onPress={() => props.onToggleMember(member.id)}
               />
             ))}
@@ -1220,11 +1991,12 @@ function ExpenseScreen(props: {
         <View style={styles.selectorBlock}>
           <Text style={styles.label}>Paid by</Text>
           <View style={styles.chipWrap}>
-            {paidByMembers.map((member) => (
+            {orderedMembers.map((member) => (
               <Chip
                 key={member.id}
                 label={member.displayName}
                 selected={selectedPayerId === member.id}
+                isCurrent={member.id === props.groupState.currentMemberId}
                 onPress={() => props.onSelectPayer(member.id)}
               />
             ))}
@@ -1278,23 +2050,35 @@ function Page({
   );
 }
 
-function Balances({ balances, currency }: { balances: Balance[]; currency: string }) {
+function Balances({
+  balances,
+  currency,
+  currentMemberId
+}: {
+  balances: Balance[];
+  currency: string;
+  currentMemberId: string | null;
+}) {
   return (
     <View style={styles.panel}>
       {balances.length === 0 ? (
         <Text style={styles.emptyText}>No balances yet.</Text>
       ) : (
-        balances.map((balance) => (
-          <View key={balance.memberId} style={styles.balanceItem}>
-            <Text style={styles.balanceTitle} numberOfLines={2}>
-              {balance.displayName}
-            </Text>
-            <RowValue
-              value={`${balance.balanceCents >= 0 ? "+" : ""}${money(balance.balanceCents, currency)}`}
-              tone={balance.balanceCents < 0 ? "negative" : "positive"}
-            />
-          </View>
-        ))
+        balances.map((balance) => {
+          const isCurrent = balance.memberId === currentMemberId;
+          return (
+            <View key={balance.memberId} style={[styles.balanceItem, isCurrent && styles.listItemSelected]}>
+              <Text style={[styles.balanceTitle, isCurrent && styles.currentUserName]} numberOfLines={2}>
+                {balance.displayName}
+                {isCurrent ? <Text style={styles.currentUserYouSuffix}>{"  (you)"}</Text> : null}
+              </Text>
+              <RowValue
+                value={`${balance.balanceCents >= 0 ? "+" : ""}${money(balance.balanceCents, currency)}`}
+                tone={balance.balanceCents < 0 ? "negative" : "positive"}
+              />
+            </View>
+          );
+        })
       )}
     </View>
   );
@@ -1497,16 +2281,31 @@ function BareIconButton({ children, label, onPress }: { children: React.ReactNod
   );
 }
 
-function Chip({ label, selected, onPress }: { label: string; selected: boolean; onPress: () => void }) {
+function Chip({
+  label,
+  selected,
+  isCurrent = false,
+  onPress
+}: {
+  label: string;
+  selected: boolean;
+  isCurrent?: boolean;
+  onPress: () => void;
+}) {
   return (
     <PaperChip
+      compact
       selected={selected}
       onPress={onPress}
       showSelectedOverlay={false}
       style={[styles.chip, selected && styles.chipSelected]}
-      textStyle={[styles.chipText, selected && styles.chipTextSelected]}
+      textStyle={[styles.chipText, selected && !isCurrent && styles.chipTextSelected]}
     >
-      {label}
+      {isCurrent ? (
+        <Text style={[styles.chipText, styles.currentUserName]}>{label}</Text>
+      ) : (
+        label
+      )}
     </PaperChip>
   );
 }
@@ -1532,11 +2331,41 @@ function preferredPayerId(state: GroupState) {
     : state.members[0]?.id ?? "";
 }
 
-function currentMemberFirst(members: Member[], currentMemberId: string | null) {
-  if (!currentMemberId) return members;
-  const currentMember = members.find((member) => member.id === currentMemberId);
-  if (!currentMember) return members;
-  return [currentMember, ...members.filter((member) => member.id !== currentMemberId)];
+function sortJoinSlotsForDisplay(slots: GroupSlot[]) {
+  const order = new Map(slots.map((slot, index) => [slot.id, index]));
+  return [...slots].sort((a, b) => {
+    if (a.claimed !== b.claimed) return a.claimed ? 1 : -1;
+    return (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
+  });
+}
+
+function draftMemberId() {
+  return `draft_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function sortMemberListForDisplay(members: MemberListEntry[]) {
+  const order = new Map(members.map((member, index) => [member.id, index]));
+  const rank = (member: MemberListEntry) => {
+    if (member.isCurrent) return 0;
+    if (member.claimed) return 1;
+    return 2;
+  };
+  return [...members].sort((a, b) => {
+    const rankDiff = rank(a) - rank(b);
+    if (rankDiff !== 0) return rankDiff;
+    return (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
+  });
+}
+
+function sortMembersForDisplay(members: Member[], currentMemberId: string | null) {
+  return sortMemberListForDisplay(
+    members.map((member) => ({
+      id: member.id,
+      displayName: member.displayName,
+      isCurrent: member.id === currentMemberId,
+      claimed: member.claimed
+    }))
+  );
 }
 
 function isKnownGroup(value: unknown): value is KnownGroup {
@@ -1659,8 +2488,8 @@ function createStyles(colors: AppColors) {
   },
   selectorBlock: {
     paddingHorizontal: spacing.pageX,
-    paddingVertical: 14,
-    gap: spacing.rowGap
+    paddingVertical: 10,
+    gap: 8
   },
   selectorDivider: {
     height: StyleSheet.hairlineWidth,
@@ -1698,6 +2527,160 @@ function createStyles(colors: AppColors) {
     color: colors.label,
     ...typography.label
   },
+  sectionLabel: {
+    color: colors.label,
+    paddingHorizontal: spacing.pageX,
+    paddingTop: spacing.rowGap,
+    ...typography.label
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: spacing.pageX,
+    paddingTop: spacing.rowGap,
+    paddingBottom: 4
+  },
+  sectionLabelInline: {
+    color: colors.label,
+    ...typography.label
+  },
+  sectionAddButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    minHeight: 44,
+    paddingHorizontal: 8,
+    borderRadius: 8
+  },
+  sectionAddLabel: {
+    color: colors.primary,
+    ...typography.label,
+    fontWeight: "700"
+  },
+  memberAddRow: {
+    minHeight: 52,
+    paddingHorizontal: spacing.pageX,
+    paddingVertical: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.rowGap,
+    backgroundColor: colors.surfaceSelected
+  },
+  memberAddInput: {
+    flex: 1,
+    minHeight: 36,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.primary,
+    backgroundColor: colors.surface,
+    color: colors.text,
+    ...typography.rowTitle
+  },
+  pickRow: {
+    minHeight: 52,
+    paddingHorizontal: spacing.pageX,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.rowGap,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.borderSubtle
+  },
+  pickRowTaken: {
+    opacity: 0.72
+  },
+  pickRowPressable: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: "center"
+  },
+  joinCustomNameInput: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 36,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.primary,
+    backgroundColor: colors.surface,
+    color: colors.text,
+    ...typography.rowTitle
+  },
+  joinCustomNameInputError: {
+    borderColor: colors.danger
+  },
+  memberAddBlock: {
+    backgroundColor: colors.surfaceSelected
+  },
+  memberAddInputError: {
+    borderColor: colors.danger
+  },
+  fieldError: {
+    color: colors.danger,
+    paddingHorizontal: spacing.pageX,
+    paddingTop: 6,
+    paddingBottom: 2,
+    ...typography.meta
+  },
+  memberAvatar: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  memberAvatarYou: {
+    backgroundColor: colors.chipSelected,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.primary
+  },
+  memberAvatarClaimed: {
+    backgroundColor: colors.chipSelected
+  },
+  memberAvatarOpen: {
+    backgroundColor: colors.background,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.borderControl
+  },
+  memberAvatarInitial: {
+    color: colors.primary,
+    fontSize: 13,
+    fontWeight: "800"
+  },
+  memberNameUnclaimed: {
+    color: colors.muted
+  },
+  memberListNamePressable: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: "center"
+  },
+  memberListNameInput: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 36,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.primary,
+    backgroundColor: colors.surface,
+    color: colors.text,
+    ...typography.rowTitle
+  },
+  pickName: {
+    flex: 1,
+    color: colors.text,
+    ...typography.body
+  },
+  pickNameTaken: {
+    color: colors.muted
+  },
   input: {
     minHeight: 54,
     backgroundColor: colors.background,
@@ -1717,6 +2700,29 @@ function createStyles(colors: AppColors) {
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: colors.borderSubtle
   },
+  settingRowEditing: {
+    backgroundColor: colors.surfaceSelected
+  },
+  inlinePasswordInput: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 36,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.primary,
+    backgroundColor: colors.surface,
+    color: colors.text,
+    ...typography.rowTitle
+  },
+  inlinePasswordEditingWrap: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.rowGap
+  },
   settingLabel: {
     color: colors.text,
     ...typography.body,
@@ -1735,6 +2741,51 @@ function createStyles(colors: AppColors) {
     color: colors.muted,
     ...typography.rowTitle,
     fontWeight: "600"
+  },
+  settingValueMuted: {
+    color: colors.iconMuted,
+    fontWeight: "500"
+  },
+  inlineEditableRow: {
+    paddingHorizontal: spacing.pageX,
+    paddingVertical: 12,
+    gap: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.borderSubtle
+  },
+  inlineEditableRowActive: {
+    backgroundColor: colors.surfaceSelected
+  },
+  inlineEditableLabel: {
+    color: colors.label,
+    ...typography.meta,
+    fontWeight: "600"
+  },
+  inlineEditableValueRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: spacing.rowGap,
+    minHeight: 28
+  },
+  inlineEditableValue: {
+    flex: 1,
+    color: colors.text,
+    ...typography.rowTitle
+  },
+  inlineEditablePlaceholder: {
+    color: colors.muted
+  },
+  inlineEditableInput: {
+    minHeight: 36,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.primary,
+    backgroundColor: colors.surface,
+    color: colors.text,
+    ...typography.rowTitle
   },
   buttonRow: {
     flexDirection: "row",
@@ -1845,6 +2896,14 @@ function createStyles(colors: AppColors) {
     flex: 1,
     minWidth: 0
   },
+  groupCodePressable: {
+    alignSelf: "flex-start",
+    marginTop: 2,
+    borderRadius: 6,
+    paddingVertical: 2,
+    paddingHorizontal: 2,
+    marginHorizontal: -2
+  },
   rowAccessory: {
     minWidth: 72,
     alignItems: "flex-end",
@@ -1909,6 +2968,14 @@ function createStyles(colors: AppColors) {
     flex: 1,
     color: colors.text,
     ...typography.rowTitle
+  },
+  currentUserName: {
+    color: colors.userName,
+    fontWeight: "700"
+  },
+  currentUserYouSuffix: {
+    color: colors.userName,
+    fontWeight: "400"
   },
   expenseTextBlock: {
     flex: 1,
@@ -1998,14 +3065,14 @@ function createStyles(colors: AppColors) {
   chipWrap: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 8
+    gap: 6
   },
   chip: {
-    minHeight: 38,
-    borderRadius: 8,
+    minHeight: 30,
+    borderRadius: 6,
     borderWidth: 1,
     borderColor: colors.chipBorder,
-    paddingHorizontal: 12,
+    paddingHorizontal: 8,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: colors.surface
@@ -2016,7 +3083,11 @@ function createStyles(colors: AppColors) {
   },
   chipText: {
     color: colors.label,
-    ...typography.label
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: "600",
+    marginVertical: 0,
+    marginHorizontal: 0
   },
   chipTextSelected: {
     color: colors.expenseName

@@ -1,4 +1,5 @@
 import type { AbstractPowerSyncDatabase, PowerSyncBackendConnector } from "@powersync/common";
+import { peekPendingGroupPassword, takePendingGroupPassword } from "../groupPassword";
 import { supabase, ensureAnonymousSession } from "./supabase";
 
 const powersyncUrl = process.env.EXPO_PUBLIC_POWERSYNC_URL;
@@ -22,22 +23,19 @@ export class SupabasePowerSyncConnector implements PowerSyncBackendConnector {
     if (!transaction) return;
 
     // Two rails:
-    //   - Lifecycle (group/member creation) is handled by dedicated, gated Edge
-    //     Functions (create-group / join-group), never the generic sync path.
-    //     Local group inserts trigger idempotent ratification; local member
-    //     inserts are dropped (the server owns membership).
-    //   - Data (expenses/splits/activity/renames) flows through sync-upload,
-    //     which authorizes each op by membership. Expense uploads are therefore
-    //     implicitly gated behind successful ratification (membership must
-    //     exist server-side first).
+    //   - Group creation is ratified by the gated create-group Edge Function,
+    //     which also inserts the group's initial member slots (binding the
+    //     creator). A local group insert triggers idempotent ratification.
+    //   - Everything else (member slots, expenses/splits/activity/renames)
+    //     flows through sync-upload, which authorizes each op by membership.
+    //     Member-slot PUTs are therefore implicitly gated behind successful
+    //     ratification, and sync-upload only ever creates *unclaimed* slots, so
+    //     it can never downgrade the creator's binding.
     const dataOps: Array<Record<string, unknown>> = [];
 
     for (const op of transaction.crud) {
       if (op.table === "groups" && op.op === "PUT") {
         await this.ratifyGroup(database, op.id, op.opData ?? null);
-        continue;
-      }
-      if (op.table === "members" && op.op === "PUT") {
         continue;
       }
       dataOps.push({
@@ -67,14 +65,21 @@ export class SupabasePowerSyncConnector implements PowerSyncBackendConnector {
     groupId: string,
     data: Record<string, unknown> | null
   ) {
-    const creator = await database.getOptional<{
+    // Ratify the whole local member roster. Each slot is created unclaimed
+    // server-side except the creator's, identified by the slot that carries a
+    // local device_id (offline, only the creator's own slot has one).
+    const members = await database.getAll<{
       id: string;
       display_name: string;
       device_id: string | null;
+      created_at: string | null;
     }>(
-      "SELECT id, display_name, device_id FROM members WHERE group_id = ? ORDER BY created_at ASC LIMIT 1",
+      "SELECT id, display_name, device_id, created_at FROM members WHERE group_id = ? AND deleted_at IS NULL ORDER BY created_at ASC",
       [groupId]
     );
+
+    const creator = members.find((member) => member.device_id != null) ?? members[0];
+    const pendingPassword = await peekPendingGroupPassword(groupId);
 
     const { data: result, error } = await supabase!.functions.invoke<{ code?: string }>("create-group", {
       body: {
@@ -83,17 +88,29 @@ export class SupabasePowerSyncConnector implements PowerSyncBackendConnector {
         name: data?.name,
         currency: data?.currency,
         createdAt: data?.created_at,
-        member: creator
-          ? { id: creator.id, displayName: creator.display_name, deviceId: creator.device_id }
-          : undefined
+        creatorMemberId: creator?.id,
+        members: members.map((member) => ({
+          id: member.id,
+          name: member.display_name,
+          deviceId: member.device_id,
+          createdAt: member.created_at
+        })),
+        password: pendingPassword ?? undefined
       }
     });
 
-    if (error) throw new Error(await getSupabaseFunctionErrorMessage(error));
+    if (error) {
+      throw new Error(await getSupabaseFunctionErrorMessage(error));
+    }
 
+    if (pendingPassword) {
+      await takePendingGroupPassword(groupId);
+      await database.execute("UPDATE groups SET has_password = 1 WHERE id = ?", [groupId]);
+    }
+
+    const serverCode = result?.code;
     // If the server had to mint a different code (collision), adopt it locally
     // so the creator's view stays consistent without waiting for a download.
-    const serverCode = result?.code;
     if (typeof serverCode === "string" && serverCode !== data?.code) {
       await database.execute("UPDATE groups SET code = ? WHERE id = ?", [serverCode, groupId]);
     }

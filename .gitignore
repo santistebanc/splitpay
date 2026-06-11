@@ -7,6 +7,9 @@ web-build/
 .env
 .env.local
 
+# Local MCP config — holds a Supabase access token, never commit it.
+.cursor/mcp.json
+
 # Generated native project (recreate with `expo prebuild`)
 /apps/mobile/android/
 /apps/mobile/ios/

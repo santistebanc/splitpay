@@ -6,11 +6,16 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "bash scripts/dev-local.sh",
-    "dev:mobile": "npm --workspace apps/mobile run start",
-    "dev:web": "npm --workspace apps/mobile run web",
-    "serve:web": "npm --workspace apps/mobile run serve:web",
+    "dev": "bash scripts/dev.sh",
+    "dev:web": "bash scripts/dev.sh web",
+    "dev:android": "bash scripts/dev.sh android",
+    "dev:ios": "bash scripts/dev.sh ios",
+    "dev:tunnel": "bash scripts/dev.sh tunnel",
+    "web:build": "npm --workspace apps/mobile run export:web",
+    "web:preview": "bash scripts/dev-local.sh",
+    "web:watch": "npm --workspace apps/mobile run watch:web",
     "deploy:supabase": "bash supabase/deploy.sh",
+    "test": "npm --workspace apps/mobile run test",
     "typecheck": "npm --workspaces run typecheck",
     "lint": "npm --workspaces run lint"
   }

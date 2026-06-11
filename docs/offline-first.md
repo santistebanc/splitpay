@@ -7,10 +7,31 @@ SplitPay now uses a local-first architecture:
 - Supabase Auth + Postgres
 - PowerSync Cloud for sync
 - Supabase Edge Functions for all writes and group lifecycle:
-  - `sync-upload` — queued local data writes (expenses/splits/activity, renames); the server-side authorization boundary
-  - `create-group` — ratifies a locally-created group on first connection
-  - `join-group` — joins by code, enforcing the optional password
+  - `sync-upload` — queued local data writes (expenses/splits/activity, renames, and **unclaimed** member-slot creation/removal); the server-side authorization boundary
+  - `create-group` — ratifies a locally-created group on first connection, inserting its initial member slots and binding the creator's
+  - `join-group` — previews a group's member slots, then joins by **claiming** a slot (or adding a new one), enforcing the optional password
   - `set-password` — sets / changes / removes a group's join password
+
+## Member slots
+
+A group is a set of named **member slots**. A slot may be:
+
+- **claimed** — bound to a user (`members.user_id` is set); that user "is" this member, and
+- **unclaimed** — just a name (`user_id IS NULL`) that anyone in the group can record
+  expenses against, and that a future joiner can claim.
+
+Rules (all enforced server-side):
+
+- The creator defines the initial slots offline and claims one of them. Other
+  people's slots start unclaimed.
+- Any active member can add unclaimed slots (works offline; they sync as
+  unclaimed) and rename unclaimed slots; a claimed slot is renamed only by its
+  owner.
+- **Claiming** a slot (assigning `user_id`) only ever happens through
+  `create-group` (the creator) or `join-group` (a joiner). `sync-upload` never
+  writes `user_id` and only ever creates unclaimed slots, so it can't be used to
+  impersonate or to downgrade the creator's binding.
+- A slot with expenses/splits can't be removed until they're settled and deleted.
 
 ## Environment Variables
 
@@ -59,7 +80,8 @@ clients:
   enumeration). Durable proof of authorization is the member's row + JWT, not
   the password.
 - All subsequent writes are authorized by `sync-upload`, which checks active
-  group membership and rejects client-side group/member creation.
+  group membership, never assigns `user_id`, and rejects client-side group
+  creation.
 
 ## PowerSync
 
