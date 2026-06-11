@@ -4,7 +4,7 @@ import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator, NativeStackNavigationProp } from "@react-navigation/native-stack";
 import * as Clipboard from "expo-clipboard";
 import { StatusBar } from "expo-status-bar";
-import { ArrowLeft, Check, ChevronRight, Copy, Lock, Plus, Settings, User, UserCheck, Users, X } from "lucide-react-native";
+import { ArrowLeft, Check, ChevronRight, Copy, Lock, Plus, Settings, User, UserCheck, Users, WifiOff, X } from "lucide-react-native";
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -55,7 +55,8 @@ import {
   subscribeToConnection,
   subscribeToGroup,
   updateExpense,
-  updateGroupName
+  updateGroupName,
+  type ConnectionStatus
 } from "./src/api";
 import { splitActivitySummary, withoutLeadingActor } from "./src/activityText";
 import {
@@ -99,6 +100,7 @@ const Stack = createNativeStackNavigator<RootStackParamList>();
 
 let colors: AppColors = lightColors;
 let styles = createStyles(colors);
+let offlineBannerSlot: React.ReactNode = null;
 
 function createPaperTheme(activeColors: AppColors, isDark: boolean) {
   const baseTheme = isDark ? MD3DarkTheme : MD3LightTheme;
@@ -176,7 +178,8 @@ export default function App() {
   const [copyingCode, setCopyingCode] = useState<string | null>(null);
   const [settlingKey, setSettlingKey] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
-  const [isOnline, setIsOnline] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
+  const isOnline = connectionStatus === "online";
   const [joinPassword, setJoinPassword] = useState("");
   const [joinNeedsPassword, setJoinNeedsPassword] = useState(false);
   const [joinStep, setJoinStep] = useState<"code" | "pick">("code");
@@ -197,9 +200,9 @@ export default function App() {
     void loadStoredGroupPassword(groupState.group.code).then(setStoredGroupPassword);
   }, [groupState?.group.code, groupState?.group.hasPassword]);
 
-  useEffect(() => subscribeToConnection((online) => {
-    setIsOnline(online);
-    if (online) void flushPendingLeaves();
+  useEffect(() => subscribeToConnection((status) => {
+    setConnectionStatus(status);
+    if (status === "online") void flushPendingLeaves();
   }), []);
 
   useEffect(() => {
@@ -685,6 +688,13 @@ export default function App() {
     ]);
   }
 
+  offlineBannerSlot =
+    connectionStatus === "connecting" ? (
+      <ConnectingBanner />
+    ) : connectionStatus === "offline" ? (
+      <OfflineBanner />
+    ) : null;
+
   if (isLoading) {
     return (
       <PaperProvider theme={paperTheme}>
@@ -1154,6 +1164,29 @@ function JoinGroupScreen(props: {
 
 function OfflineNotice({ action }: { action: string }) {
   return <Text style={styles.offlineNotice}>{action} needs you to be online.</Text>;
+}
+
+function ConnectingBanner() {
+  return (
+    <View style={styles.offlineBanner} accessibilityRole="text" accessibilityLabel="Connecting">
+      <View style={styles.offlineBannerRow}>
+        <ActivityIndicator color={colors.warning} size="small" />
+        <Text style={styles.offlineBannerText}>Connecting…</Text>
+      </View>
+    </View>
+  );
+}
+
+function OfflineBanner() {
+  return (
+    <View style={styles.offlineBanner} accessibilityRole="text" accessibilityLabel="You're offline. Changes sync when you're back online">
+      <View style={styles.offlineBannerRow}>
+        <WifiOff color={colors.warning} size={14} />
+        <Text style={styles.offlineBannerText}>You're offline</Text>
+      </View>
+      <Text style={styles.offlineBannerHint}>Changes sync when you're back online</Text>
+    </View>
+  );
 }
 
 function GroupViewScreen({
@@ -2123,6 +2156,7 @@ function Page({
 }) {
   return (
     <SafeAreaView edges={["top", "left", "right"]} style={styles.safeArea}>
+      {offlineBannerSlot}
       <ScrollView
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
@@ -3167,6 +3201,29 @@ function createStyles(colors: AppColors) {
     color: colors.muted,
     ...typography.meta,
     paddingHorizontal: spacing.pageX
+  },
+  offlineBanner: {
+    alignItems: "center",
+    backgroundColor: colors.surfaceSelected,
+    paddingVertical: 8,
+    paddingHorizontal: spacing.pageX,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border
+  },
+  offlineBannerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6
+  },
+  offlineBannerText: {
+    color: colors.warning,
+    ...typography.meta,
+    fontWeight: "800"
+  },
+  offlineBannerHint: {
+    color: colors.muted,
+    ...typography.meta,
+    fontWeight: "600"
   },
   loadingPanel: {
     minHeight: 96,

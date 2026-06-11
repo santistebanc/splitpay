@@ -2,7 +2,7 @@ import { clearPendingLeave, listPendingLeaveGroupIds, rememberPendingLeave } fro
 import { MIN_GROUP_PASSWORD_LENGTH, rememberPendingGroupPassword } from "./groupPassword";
 import { calculateBalances, isSettlementPayment } from "./ledger";
 import { DEFAULT_MEMBER_NAME, DUPLICATE_MEMBER_NAME_ERROR, isMemberNameTaken } from "./memberNames";
-import { powersync, setupPowerSync } from "./localFirst/system";
+import { initPowerSync, powersync, setupPowerSync } from "./localFirst/system";
 import { ensureAnonymousSession, supabase } from "./localFirst/supabase";
 
 export type Member = {
@@ -482,22 +482,46 @@ export function isSyncConfigured() {
   return Boolean(supabase);
 }
 
+export type ConnectionStatus = "online" | "offline" | "connecting";
+
+function readConnectionStatus(): ConnectionStatus {
+  if (!supabase) return "offline";
+  if (powersync.connected) return "online";
+  if (powersync.connecting) return "connecting";
+  return "offline";
+}
+
 // Reports online status (configured + PowerSync connected) and notifies on
 // change so the UI can disable online-only features while offline.
-export function subscribeToConnection(onChange: (online: boolean) => void) {
+export function subscribeToConnection(onChange: (status: ConnectionStatus) => void) {
   if (!supabase) {
-    onChange(false);
+    onChange("offline");
     return () => {};
   }
   let disposed = false;
   let dispose: (() => void) | undefined;
-  void setupPowerSync().then(() => {
-    if (disposed) return;
-    onChange(Boolean(powersync.connected));
-    dispose = powersync.registerListener({
-      statusChanged: (status) => onChange(Boolean(status.connected))
-    });
-  });
+
+  void (async () => {
+    try {
+      // Attach before connect finishes so we don't miss the connected status event.
+      await initPowerSync();
+      if (disposed) return;
+
+      dispose = powersync.registerListener({
+        statusChanged: () => {
+          if (!disposed) onChange(readConnectionStatus());
+        }
+      });
+      onChange(readConnectionStatus());
+
+      await setupPowerSync();
+      if (!disposed) onChange(readConnectionStatus());
+    } catch (error) {
+      console.warn("PowerSync setup failed", error);
+      if (!disposed) onChange("offline");
+    }
+  })();
+
   return () => {
     disposed = true;
     dispose?.();
@@ -532,7 +556,7 @@ async function getSupabaseFunctionErrorMessage(error: unknown) {
 }
 
 export async function fetchGroup(code: string, deviceId?: string) {
-  await setupPowerSync();
+  await initPowerSync();
   const group = await findGroupByCode(code);
   if (!group) throw new Error("Group not found locally");
 
@@ -597,7 +621,7 @@ export async function fetchGroup(code: string, deviceId?: string) {
 }
 
 export async function fetchActivityLogs(code: string) {
-  await setupPowerSync();
+  await initPowerSync();
   const group = await findGroupByCode(code);
   if (!group) return [];
   const rows = await powersync.getAll<ActivityRow>(
@@ -788,7 +812,7 @@ export async function deleteExpense(code: string, expenseId: string, deviceId?: 
 export function subscribeToGroup(code: string, deviceId: string, onChange: (state: GroupState) => void, onError?: (error: unknown) => void) {
   const abortController = new AbortController();
 
-  void setupPowerSync().then(() => {
+  void initPowerSync().then(() => {
     powersync.watch(
       `SELECT
          (SELECT COUNT(*) FROM groups) AS groups_count,
