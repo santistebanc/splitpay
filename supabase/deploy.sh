@@ -26,7 +26,7 @@ fi
 if [[ $# -gt 0 ]]; then
   FUNCTIONS=("$@")
 else
-  FUNCTIONS=(create-group join-group set-password sync-upload)
+  FUNCTIONS=(create-group join-group leave-group set-password sync-upload)
 fi
 
 for fn in "${FUNCTIONS[@]}"; do

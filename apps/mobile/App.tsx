@@ -45,6 +45,8 @@ import {
   GroupState,
   JoinError,
   joinGroup,
+  flushPendingLeaves,
+  leaveGroup,
   Member,
   previewGroupMembers,
   removeMember,
@@ -87,7 +89,7 @@ type RootStackParamList = {
   Activity: undefined;
 };
 type Navigation = NativeStackNavigationProp<RootStackParamList>;
-type SettingsSaving = "groupName" | "password" | "members" | null;
+type SettingsSaving = "groupName" | "password" | "members" | "exit" | null;
 
 type ButtonIcon = (props: { color: string; size: number }) => React.ReactNode;
 type ButtonVariant = "primary" | "secondary" | "danger";
@@ -171,6 +173,7 @@ export default function App() {
   const [activityLogs, setActivityLogs] = useState<ActivityLog[]>([]);
   const [isLoadingActivity, setIsLoadingActivity] = useState(false);
   const [loadingGroupCode, setLoadingGroupCode] = useState<string | null>(null);
+  const [copyingCode, setCopyingCode] = useState<string | null>(null);
   const [settlingKey, setSettlingKey] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
   const [isOnline, setIsOnline] = useState(false);
@@ -194,7 +197,10 @@ export default function App() {
     void loadStoredGroupPassword(groupState.group.code).then(setStoredGroupPassword);
   }, [groupState?.group.code, groupState?.group.hasPassword]);
 
-  useEffect(() => subscribeToConnection(setIsOnline), []);
+  useEffect(() => subscribeToConnection((online) => {
+    setIsOnline(online);
+    if (online) void flushPendingLeaves();
+  }), []);
 
   useEffect(() => {
     if (!groupState) return;
@@ -431,7 +437,7 @@ export default function App() {
   }
 
   async function openActivity(navigation: Navigation) {
-    if (!groupState) return;
+    if (!groupState || isLoadingActivity) return;
     await refreshActivityLogs(groupState.group.code);
     navigation.navigate("Activity");
   }
@@ -482,28 +488,30 @@ export default function App() {
   }
 
   async function handleExitGroup(code: string, navigation: Navigation) {
-    const nextGroups = knownGroups.filter((group) => group.code !== code);
-    setKnownGroups(nextGroups);
-    await AsyncStorage.setItem(storageKeys.knownGroups, JSON.stringify(nextGroups));
+    await runSettingsSaving("exit", async () => {
+      if (groupState?.group.code === code) {
+        await leaveGroup(code, deviceId);
+      }
 
-    if (groupState?.group.code !== code) return;
-    await rememberStoredGroupPassword(code, null);
+      const nextGroups = knownGroups.filter((group) => group.code !== code);
+      setKnownGroups(nextGroups);
+      await AsyncStorage.setItem(storageKeys.knownGroups, JSON.stringify(nextGroups));
 
-    if (nextGroups.length === 0) {
-      setGroupState(null);
-      await AsyncStorage.removeItem(storageKeys.lastGroupCode);
-      navigation.replace("Groups");
-      return;
-    }
+      if (groupState?.group.code !== code) return;
+      await rememberStoredGroupPassword(code, null);
 
-    try {
+      if (nextGroups.length === 0) {
+        setGroupState(null);
+        await AsyncStorage.removeItem(storageKeys.lastGroupCode);
+        navigation.replace("Groups");
+        return;
+      }
+
       const state = await fetchGroup(nextGroups[0].code, deviceId);
       await rememberLastGroup(state.group.code);
       setGroupState(state);
       navigation.replace("Groups");
-    } catch (error) {
-      presentError(error);
-    }
+    });
   }
 
   async function handleAddExpense(navigation: Navigation) {
@@ -658,8 +666,14 @@ export default function App() {
   }
 
   async function copyGroupCode(code: string) {
-    await Clipboard.setStringAsync(code);
-    Alert.alert("Code copied", code);
+    if (copyingCode) return;
+    setCopyingCode(code);
+    try {
+      await Clipboard.setStringAsync(code);
+      Alert.alert("Code copied", code);
+    } finally {
+      setCopyingCode(null);
+    }
   }
 
   function withTimeout<T>(promise: Promise<T>, ms: number) {
@@ -700,6 +714,7 @@ export default function App() {
               <GroupsScreen
                 currentGroupCode={groupState?.group.code ?? ""}
                 loadingGroupCode={loadingGroupCode}
+                copyingCode={copyingCode}
                 knownGroups={knownGroups}
                 onNewGroup={() => navigation.navigate("NewGroup")}
                 onJoinGroup={() => navigation.navigate("JoinGroup")}
@@ -761,6 +776,7 @@ export default function App() {
               groupState ? (
                 <GroupViewScreen
                   groupState={groupState}
+                  copyingCode={copyingCode}
                   onShare={() => copyGroupCode(groupState.group.code)}
                   onExpense={() => startNewExpense(navigation)}
                   onSettle={() => navigation.navigate("Settle")}
@@ -772,6 +788,7 @@ export default function App() {
                 <GroupsScreen
                   currentGroupCode=""
                   loadingGroupCode={loadingGroupCode}
+                  copyingCode={copyingCode}
                   knownGroups={knownGroups}
                   onNewGroup={() => navigation.navigate("NewGroup")}
                   onJoinGroup={() => navigation.navigate("JoinGroup")}
@@ -801,6 +818,8 @@ export default function App() {
                   isSaving={isSaving}
                   settingsSaving={settingsSaving}
                   isOnline={isOnline}
+                  isLoadingActivity={isLoadingActivity}
+                  copyingCode={copyingCode}
                   onAddMember={handleAddMember}
                   onRemoveMember={handleRemoveMember}
                   onRenameMember={handleRenameMember}
@@ -816,6 +835,7 @@ export default function App() {
                 <GroupsScreen
                   currentGroupCode=""
                   loadingGroupCode={loadingGroupCode}
+                  copyingCode={copyingCode}
                   knownGroups={knownGroups}
                   onNewGroup={() => navigation.navigate("NewGroup")}
                   onJoinGroup={() => navigation.navigate("JoinGroup")}
@@ -1046,7 +1066,7 @@ function JoinGroupScreen(props: {
           {orderedSlots.map((slot) => (
             <TactilePressable
               key={slot.id}
-              disabled={slot.claimed}
+              disabled={slot.claimed || props.isSaving}
               style={[
                 styles.pickRow,
                 slot.claimed && styles.pickRowTaken,
@@ -1071,6 +1091,7 @@ function JoinGroupScreen(props: {
                 value={props.customName}
                 onChangeText={props.onCustomNameChange}
                 autoFocus
+                editable={!props.isSaving}
                 placeholder="Alex"
                 placeholderTextColor={colors.iconMuted}
                 returnKeyType="done"
@@ -1137,6 +1158,7 @@ function OfflineNotice({ action }: { action: string }) {
 
 function GroupViewScreen({
   groupState,
+  copyingCode,
   onShare,
   onExpense,
   onSettle,
@@ -1145,6 +1167,7 @@ function GroupViewScreen({
   onEditExpense
 }: {
   groupState: GroupState;
+  copyingCode: string | null;
   onShare: () => void;
   onExpense: () => void;
   onSettle: () => void;
@@ -1157,7 +1180,13 @@ function GroupViewScreen({
   return (
     <Page
       onBack={onBack}
-      centerAction={<CodeHeaderButton code={groupState.group.code} onPress={onShare} />}
+      centerAction={
+        <CodeHeaderButton
+          code={groupState.group.code}
+          loading={copyingCode === groupState.group.code}
+          onPress={onShare}
+        />
+      }
       rightAction={<SettingsButton onPress={onSettings} />}
     >
       <ActiveGroupDetails groupState={groupState} />
@@ -1183,6 +1212,7 @@ function GroupViewScreen({
 function GroupsScreen(props: {
   currentGroupCode: string;
   loadingGroupCode: string | null;
+  copyingCode: string | null;
   knownGroups: KnownGroup[];
   onNewGroup: () => void;
   onJoinGroup: () => void;
@@ -1201,6 +1231,7 @@ function GroupsScreen(props: {
                 group={knownGroup}
                 isCurrent={knownGroup.code === props.currentGroupCode}
                 isLoading={knownGroup.code === props.loadingGroupCode}
+                isCopying={knownGroup.code === props.copyingCode}
                 onPress={() => props.onSelectGroup(knownGroup.code)}
                 onCopyCode={() => props.onCopyCode(knownGroup.code)}
               />
@@ -1221,12 +1252,14 @@ function GroupListItem({
   group,
   isCurrent,
   isLoading,
+  isCopying,
   onPress,
   onCopyCode
 }: {
   group: KnownGroup;
   isCurrent: boolean;
   isLoading: boolean;
+  isCopying: boolean;
   onPress: () => void;
   onCopyCode: () => void;
 }) {
@@ -1247,11 +1280,16 @@ function GroupListItem({
         <TactilePressable
           accessibilityLabel="Copy group code"
           style={styles.groupCodePressable}
-          onPress={onCopyCode}
+          onPress={isCopying ? undefined : onCopyCode}
+          disabled={isCopying}
         >
-          <Text style={styles.meta} numberOfLines={1}>
-            {group.code}
-          </Text>
+          {isCopying ? (
+            <ActivityIndicator color={colors.primary} size="small" />
+          ) : (
+            <Text style={styles.meta} numberOfLines={1}>
+              {group.code}
+            </Text>
+          )}
         </TactilePressable>
       </View>
       <View style={styles.rowAccessory}>
@@ -1286,10 +1324,27 @@ function ActiveGroupDetails(props: {
   );
 }
 
-function CodeHeaderButton({ code, onPress }: { code: string; onPress: () => void }) {
+function CodeHeaderButton({
+  code,
+  loading = false,
+  onPress
+}: {
+  code: string;
+  loading?: boolean;
+  onPress: () => void;
+}) {
   return (
-    <TactilePressable accessibilityLabel="Copy group code" style={styles.headerCodeButton} onPress={onPress}>
-      <Text style={styles.headerCode}>{code}</Text>
+    <TactilePressable
+      accessibilityLabel="Copy group code"
+      style={styles.headerCodeButton}
+      onPress={loading ? undefined : onPress}
+      disabled={loading}
+    >
+      {loading ? (
+        <ActivityIndicator color={colors.primary} size="small" />
+      ) : (
+        <Text style={styles.headerCode}>{code}</Text>
+      )}
     </TactilePressable>
   );
 }
@@ -1406,10 +1461,13 @@ function MemberListName(props: {
 
   return (
     <Pressable style={styles.memberListNamePressable} onPress={startEditing} disabled={props.saving}>
-      <Text style={props.textStyle} numberOfLines={1}>
+      <Text style={[props.textStyle, styles.memberListNameText]} numberOfLines={1}>
         {props.value}
         {props.youSuffix ? <Text style={styles.currentUserYouSuffix}>{"  (you)"}</Text> : null}
       </Text>
+      {props.saving ? (
+        <ActivityIndicator color={colors.primary} size="small" style={styles.memberListNameSpinner} />
+      ) : null}
     </Pressable>
   );
 }
@@ -1432,6 +1490,7 @@ function MembersSection(props: {
   const [isAdding, setIsAdding] = useState(false);
   const [draft, setDraft] = useState("");
   const [addError, setAddError] = useState("");
+  const [isCommittingAdd, setIsCommittingAdd] = useState(false);
   const committingRef = useRef(false);
   const cancelRef = useRef(false);
 
@@ -1455,11 +1514,13 @@ function MembersSection(props: {
         return;
       }
       setAddError("");
+      setIsCommittingAdd(true);
       await props.onAddMember(name);
       setDraft("");
       if (!keepOpen) setIsAdding(false);
     } finally {
       committingRef.current = false;
+      setIsCommittingAdd(false);
     }
   }
 
@@ -1483,7 +1544,9 @@ function MembersSection(props: {
     <>
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionLabelInline}>Members</Text>
-        {isAdding ? null : (
+        {props.membersSaving ? (
+          <ActivityIndicator color={colors.primary} size="small" style={styles.sectionHeaderSpinner} />
+        ) : isAdding ? null : (
           <TactilePressable
             accessibilityLabel="Add member"
             style={styles.sectionAddButton}
@@ -1533,7 +1596,7 @@ function MembersSection(props: {
                   if (addError) setAddError("");
                 }}
                 autoFocus
-                editable={!props.isSaving}
+                editable={!props.isSaving && !isCommittingAdd}
                 placeholder={DEFAULT_MEMBER_NAME}
                 placeholderTextColor={colors.iconMuted}
                 returnKeyType="done"
@@ -1542,9 +1605,13 @@ function MembersSection(props: {
                 style={[styles.memberAddInput, addError ? styles.memberAddInputError : null]}
                 selectionColor={colors.primary}
               />
-              <BareIconButton label="Cancel adding member" onPress={cancelAdding}>
-                <X color={colors.muted} size={20} />
-              </BareIconButton>
+              {isCommittingAdd || props.membersSaving ? (
+                <ActivityIndicator color={colors.primary} size="small" />
+              ) : (
+                <BareIconButton label="Cancel adding member" onPress={cancelAdding}>
+                  <X color={colors.muted} size={20} />
+                </BareIconButton>
+              )}
             </View>
             {addError ? <Text style={styles.fieldError}>{addError}</Text> : null}
           </View>
@@ -1559,6 +1626,8 @@ function SettingsScreen(props: {
   isSaving: boolean;
   settingsSaving: SettingsSaving;
   isOnline: boolean;
+  isLoadingActivity: boolean;
+  copyingCode: string | null;
   onAddMember: (name: string) => void | Promise<void>;
   onRemoveMember: (memberId: string) => void;
   onRenameMember: (memberId: string, name: string) => void | Promise<void>;
@@ -1605,6 +1674,7 @@ function SettingsScreen(props: {
           value={props.groupState.group.code}
           onPress={props.onShare}
           accessory="copy"
+          loading={props.copyingCode === props.groupState.group.code}
         />
         <InlineEditablePassword
           hasPassword={hasPassword}
@@ -1617,12 +1687,19 @@ function SettingsScreen(props: {
         <SettingRow
           label="Activity log"
           value="View"
+          loading={props.isLoadingActivity}
           onPress={props.onActivity}
         />
       </View>
       {props.isOnline ? null : <OfflineNotice action="Changing the group password" />}
 
-      <ActionButton variant="danger" label="Exit group" onPress={props.onExit} />
+      <ActionButton
+        variant="danger"
+        label="Exit group"
+        loading={props.settingsSaving === "exit"}
+        disabled={props.isSaving && props.settingsSaving !== "exit"}
+        onPress={props.onExit}
+      />
     </Page>
   );
 }
@@ -1701,9 +1778,13 @@ function SettleScreen(props: {
         {settlements.length === 0 ? (
           <Text style={styles.emptyText}>Everyone is settled.</Text>
         ) : (
-          settlements.map((settlement) => (
+          settlements.map((settlement) => {
+            const key = settlementKey(settlement);
+            const isSettling = props.settlingKey === key;
+            const isBusy = props.settlingKey !== null;
+            return (
             <View
-              key={settlementKey(settlement)}
+              key={key}
               style={styles.settleItem}
             >
               <View style={styles.settleTextBlock}>
@@ -1715,11 +1796,13 @@ function SettleScreen(props: {
               <RowValue value={money(settlement.amountCents, props.groupState.group.currency)} dedicated />
               <SmallButton
                 label="Settle"
-                loading={props.settlingKey === settlementKey(settlement)}
+                loading={isSettling}
+                disabled={isBusy && !isSettling}
                 onPress={() => props.onSettlePayment(settlement)}
               />
             </View>
-          ))
+            );
+          })
         )}
       </View>
     </Page>
@@ -1910,17 +1993,19 @@ function SettingRow({
   label,
   value,
   accessory = "chevron",
+  loading = false,
   onPress
 }: {
   label: string;
   value: string;
   accessory?: "chevron" | "copy" | "none";
+  loading?: boolean;
   onPress?: () => void;
 }) {
   return (
     <TactilePressable
-      onPress={onPress}
-      disabled={!onPress}
+      onPress={loading ? undefined : onPress}
+      disabled={!onPress || loading}
       style={styles.settingRow}
     >
       <Text style={styles.settingLabel}>{label}</Text>
@@ -1928,7 +2013,9 @@ function SettingRow({
         <Text style={styles.settingValue} numberOfLines={1}>
           {value || "Not set"}
         </Text>
-        {accessory === "none" ? null : accessory === "copy" ? (
+        {loading ? (
+          <ActivityIndicator color={colors.primary} size="small" />
+        ) : accessory === "none" ? null : accessory === "copy" ? (
           <Copy color={colors.iconMuted} size={19} strokeWidth={2.7} />
         ) : (
           <ChevronRight color={colors.iconMuted} size={21} strokeWidth={3} />
@@ -1971,7 +2058,13 @@ function ExpenseScreen(props: {
   return (
     <Page title={props.isEditing ? "Edit" : "Add"} onBack={props.onBack}>
       <MoneyInput amount={props.amount} currency={props.groupState.group.currency} onAmountChange={props.onAmountChange} />
-      <LabeledInput label="Name" value={props.name} placeholder="Dinner" onChangeText={props.onNameChange} />
+      <LabeledInput
+        label="Name"
+        value={props.name}
+        placeholder="Dinner"
+        editable={!props.isSaving}
+        onChangeText={props.onNameChange}
+      />
       <View style={styles.panel}>
         <View style={styles.selectorBlock}>
           <Text style={styles.label}>Paid for</Text>
@@ -1982,6 +2075,7 @@ function ExpenseScreen(props: {
                 label={member.displayName}
                 selected={props.splitMemberIds.includes(member.id)}
                 isCurrent={member.id === props.groupState.currentMemberId}
+                disabled={props.isSaving}
                 onPress={() => props.onToggleMember(member.id)}
               />
             ))}
@@ -1997,6 +2091,7 @@ function ExpenseScreen(props: {
                 label={member.displayName}
                 selected={selectedPayerId === member.id}
                 isCurrent={member.id === props.groupState.currentMemberId}
+                disabled={props.isSaving}
                 onPress={() => props.onSelectPayer(member.id)}
               />
             ))}
@@ -2004,7 +2099,9 @@ function ExpenseScreen(props: {
         </View>
       </View>
       <ActionButton icon={({ color, size }) => <Check color={color} size={size} />} label={props.isEditing ? "Save" : "Add"} loading={props.isSaving} onPress={props.onSubmit} />
-      {props.isEditing ? <ActionButton variant="danger" label="Delete" onPress={props.onDelete} /> : null}
+      {props.isEditing ? (
+        <ActionButton variant="danger" label="Delete" loading={props.isSaving} onPress={props.onDelete} />
+      ) : null}
     </Page>
   );
 }
@@ -2250,10 +2347,12 @@ function ActionButton({
 function SmallButton({
   label,
   loading = false,
+  disabled = false,
   onPress
 }: {
   label: string;
   loading?: boolean;
+  disabled?: boolean;
   onPress: () => void;
 }) {
   return (
@@ -2261,7 +2360,7 @@ function SmallButton({
       compact
       mode="contained"
       loading={loading}
-      disabled={loading}
+      disabled={loading || disabled}
       onPress={onPress}
       style={styles.smallButton}
       contentStyle={styles.smallButtonContent}
@@ -2285,18 +2384,21 @@ function Chip({
   label,
   selected,
   isCurrent = false,
+  disabled = false,
   onPress
 }: {
   label: string;
   selected: boolean;
   isCurrent?: boolean;
+  disabled?: boolean;
   onPress: () => void;
 }) {
   return (
     <PaperChip
       compact
       selected={selected}
-      onPress={onPress}
+      onPress={disabled ? undefined : onPress}
+      disabled={disabled}
       showSelectedOverlay={false}
       style={[styles.chip, selected && styles.chipSelected]}
       textStyle={[styles.chipText, selected && !isCurrent && styles.chipTextSelected]}
@@ -2545,6 +2647,9 @@ function createStyles(colors: AppColors) {
     color: colors.label,
     ...typography.label
   },
+  sectionHeaderSpinner: {
+    marginRight: spacing.pageX
+  },
   sectionAddButton: {
     flexDirection: "row",
     alignItems: "center",
@@ -2658,7 +2763,16 @@ function createStyles(colors: AppColors) {
   memberListNamePressable: {
     flex: 1,
     minWidth: 0,
-    justifyContent: "center"
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
+  memberListNameText: {
+    flex: 1,
+    minWidth: 0
+  },
+  memberListNameSpinner: {
+    flexShrink: 0
   },
   memberListNameInput: {
     flex: 1,

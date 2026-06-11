@@ -1,3 +1,4 @@
+import { clearPendingLeave, listPendingLeaveGroupIds, rememberPendingLeave } from "./pendingLeave";
 import { MIN_GROUP_PASSWORD_LENGTH, rememberPendingGroupPassword } from "./groupPassword";
 import { calculateBalances, isSettlementPayment } from "./ledger";
 import { DEFAULT_MEMBER_NAME, DUPLICATE_MEMBER_NAME_ERROR, isMemberNameTaken } from "./memberNames";
@@ -119,7 +120,91 @@ type JoinSnapshot = {
   expenses: ExpenseRow[];
   expense_splits: Required<SplitRow>[];
   activity_logs: Required<ActivityRow>[];
+  claimedMemberId?: string;
 };
+
+async function applyJoinSnapshot(snapshot: JoinSnapshot) {
+  const group = snapshot.group;
+  await powersync.execute(
+    `INSERT OR REPLACE INTO groups (id, code, name, currency, has_password, created_at, updated_at, deleted_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      group.id,
+      group.code,
+      group.name,
+      group.currency,
+      Number(group.has_password ?? 0) ? 1 : 0,
+      group.created_at,
+      group.updated_at ?? group.created_at,
+      group.deleted_at ?? null
+    ]
+  );
+
+  for (const member of snapshot.members) {
+    await powersync.execute(
+      `INSERT OR REPLACE INTO members (id, group_id, display_name, device_id, user_id, created_at, updated_at, deleted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        member.id,
+        member.group_id,
+        member.display_name,
+        member.device_id ?? null,
+        member.user_id ?? null,
+        member.created_at ?? group.created_at,
+        member.updated_at ?? member.created_at ?? group.created_at,
+        member.deleted_at ?? null
+      ]
+    );
+  }
+
+  for (const expense of snapshot.expenses) {
+    await powersync.execute(
+      `INSERT OR REPLACE INTO expenses (id, group_id, description, amount_cents, paid_by_member_id, created_at, updated_at, deleted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        expense.id,
+        expense.group_id,
+        expense.description,
+        expense.amount_cents,
+        expense.paid_by_member_id,
+        expense.created_at,
+        expense.updated_at ?? expense.created_at,
+        expense.deleted_at ?? null
+      ]
+    );
+  }
+
+  for (const split of snapshot.expense_splits) {
+    await powersync.execute(
+      `INSERT OR REPLACE INTO expense_splits (id, expense_id, member_id, created_at, deleted_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        split.id,
+        split.expense_id,
+        split.member_id,
+        split.created_at ?? group.created_at,
+        split.deleted_at ?? null
+      ]
+    );
+  }
+
+  for (const log of snapshot.activity_logs) {
+    await powersync.execute(
+      `INSERT OR REPLACE INTO activity_logs (id, group_id, type, actor_member_id, actor_name, summary, metadata_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        log.id,
+        log.group_id ?? group.id,
+        log.type,
+        log.actor_member_id,
+        log.actor_name,
+        log.summary,
+        log.metadata_json ?? "{}",
+        log.created_at
+      ]
+    );
+  }
+}
 
 // Creates a group with a list of named member slots. Exactly one slot is the
 // creator (the one this device claims); it carries this device's device_id so
@@ -245,6 +330,68 @@ export async function removeMember(code: string, memberId: string, deviceId?: st
   return fetchGroup(code, deviceId);
 }
 
+// Releases this device's claimed member slot so the name can be claimed again.
+// Clears user_id and device_id locally and on the server when online.
+export async function leaveGroup(code: string, deviceId?: string) {
+  await setupPowerSync();
+  const group = await findGroupByCode(code);
+  if (!group) return;
+
+  const member = deviceId
+    ? await powersync.getOptional<MemberRow>(
+        "SELECT * FROM members WHERE group_id = ? AND device_id = ? AND deleted_at IS NULL",
+        [group.id, deviceId]
+      )
+    : null;
+
+  if (member) {
+    const now = new Date().toISOString();
+    await powersync.execute(
+      "UPDATE members SET device_id = NULL, user_id = NULL, updated_at = ? WHERE id = ?",
+      [now, member.id]
+    );
+    await insertActivity(group.id, {
+      type: "member.left",
+      actorMemberId: member.id,
+      actorName: member.display_name,
+      summary: `${member.display_name} left`,
+      metadata: { displayName: member.display_name, memberId: member.id }
+    });
+  }
+
+  try {
+    await syncLeaveGroupToServer(group.id);
+    await clearPendingLeave(group.id);
+  } catch (error) {
+    await rememberPendingLeave(group.id);
+    if (powersync.connected) throw error;
+  }
+}
+
+export async function flushPendingLeaves() {
+  if (!supabase) return;
+  await setupPowerSync();
+  await ensureAnonymousSession();
+
+  for (const groupId of await listPendingLeaveGroupIds()) {
+    try {
+      await syncLeaveGroupToServer(groupId);
+      await clearPendingLeave(groupId);
+    } catch {
+      // Keep pending for the next online retry.
+    }
+  }
+}
+
+async function syncLeaveGroupToServer(groupId: string) {
+  if (!supabase) throw new Error("Leaving a group needs you to be online.");
+  await ensureAnonymousSession();
+  const { error } = await supabase.functions.invoke("leave-group", {
+    body: { groupId }
+  });
+  if (error) throw new Error(await getSupabaseFunctionErrorMessage(error));
+}
+
 // A member slot as shown in the join picker.
 export type GroupSlot = {
   id: string;
@@ -281,10 +428,10 @@ export async function joinGroup(
 
   // Joining always goes through the server so slot picks (including "someone
   // else" after leaving locally) are honored. Re-opening a known group offline
-  // uses fetchGroup instead.
-  await joinGroupByCodeOnServer(normalizedCode, { ...input, displayName });
-  const group = await waitForGroupByCode(normalizedCode);
-  if (!group) throw new Error("Group could not be joined");
+  // uses fetchGroup instead. Apply the server snapshot locally right away so
+  // device_id (and thus "you") is available before PowerSync download catches up.
+  const snapshot = await joinGroupByCodeOnServer(normalizedCode, { ...input, displayName });
+  await applyJoinSnapshot(snapshot);
 
   return fetchGroup(normalizedCode, input.deviceId);
 }
@@ -292,7 +439,7 @@ export async function joinGroup(
 async function joinGroupByCodeOnServer(
   code: string,
   input: { displayName: string; deviceId: string; password?: string; memberId?: string }
-) {
+): Promise<JoinSnapshot> {
   if (!supabase) {
     throw new Error("Joining a group needs you to be online.");
   }
@@ -313,6 +460,7 @@ async function joinGroupByCodeOnServer(
     throw new JoinError(parsed.message, parsed.needsPassword);
   }
   if (!data?.group) throw new Error("Group not found");
+  return data;
 }
 
 // Sets, changes (non-null password), or removes (null) a group's join password.
@@ -356,22 +504,7 @@ export function subscribeToConnection(onChange: (online: boolean) => void) {
   };
 }
 
-async function waitForGroupByCode(code: string) {
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    const group = await findGroupByCode(code);
-    if (group) return group;
-    await sleep(250);
-  }
-
-  return null;
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function parseFunctionError(error: unknown, fallback: string): Promise<{ message: string; needsPassword: boolean }> {
+async function parseFunctionError(error: unknown, fallback: string) {
   const context = typeof error === "object" && error && "context" in error ? (error as { context?: Response }).context : undefined;
   if (context) {
     try {
